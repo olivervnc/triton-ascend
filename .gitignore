@@ -13,6 +13,7 @@ python/build/
 python/dist/
 python/triton*.egg-info/
 python/triton_kernels/triton*.egg-info/
+dist/
 
 python/triton/_C/*.pyd
 python/triton/_C/*.so
