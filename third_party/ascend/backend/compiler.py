@@ -1,4 +1,4 @@
-﻿# Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+# Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -73,6 +73,7 @@ from triton.backends.compiler import (
 )
 from triton.runtime.cache import get_dump_manager
 
+import shlex
 
 # TODO: materialize the concrete min shape
 def min_dot_size(target: GPUTarget):
@@ -133,6 +134,10 @@ def _adjust_metadata_by_module_result(mod, metadata, opt, **kwargs):
     if rc != -1 and rc > 0:
         # When the option dynamic_cv_pipeline is set to False,
         # these options should also reverted.
+        if os.environ.get("FALLBACK_ERROR", False) and rc != 2:
+            err_str = f"回退: {rc}"
+            print(err_str)
+            raise ValueError(err_str)
         metadata["enable_dynamic_cv_pipeline"] = False
         metadata["enable_mixed_cv"] = kwargs["enable_mixed_cv"]
         metadata["disable_auto_inject_block_sync"] = kwargs["disable_auto_inject_block_sync"]
@@ -275,6 +280,16 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
             # the public compile option.
             ascend.passes.ttir.set_enable_buffer_insert_optimization(mod)
             ascend.passes.ttir.add_dynamic_cv_pipeline(pm, compile_on_910_95)
+            # ascend.passes.ttir.pre_check_available(pm)
+            # ascend.passes.ttir.standardize_op(pm)
+            # ascend.passes.ttir.plan_compute_block(pm)
+            # ascend.passes.ttir.compute_block_opt(pm)
+            # ascend.passes.ttir.split_dataflow(pm)
+            # ascend.passes.ttir.analyse_dataflow(pm)
+            # ascend.passes.ttir.separate_memory_from_compute(pm)
+            # ascend.passes.ttir.alloc_multi_cache(pm)
+            # ascend.passes.ttir.add_control_flow_condition(pm)
+            # ascend.passes.ttir.remove_ssbuf_attr(pm)
 
         if _enable_msdebug():
             ascend.passes.ttir.add_normalize_debug_line_locations(pm)

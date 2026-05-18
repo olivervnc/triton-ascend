@@ -1789,8 +1789,10 @@ static bool
 hasMemrefDepValue(DenseMap<Value, SmallVector<Value>> &depValueMap) {
   for (auto &p : depValueMap) {
     for (Value depVal : p.second) {
-      if (isa<MemRefType>(depVal.getType()))
+      if (isa<MemRefType>(depVal.getType())) {
+        llvm::errs() << depVal << " -> " << p.first << "\n";
         return true;
+      }
     }
   }
   return false;
