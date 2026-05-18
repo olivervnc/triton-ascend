@@ -23,8 +23,14 @@
 #ifndef TRITON_ADAPTER_DYNAMIC_CV_PIPELINE_SPLIT_DATAFLOW_PASS_H
 #define TRITON_ADAPTER_DYNAMIC_CV_PIPELINE_SPLIT_DATAFLOW_PASS_H
 
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
+
+#include "bishengir/Dialect/Annotation/IR/Annotation.h"
+#include "bishengir/Dialect/HIVM/IR/HIVM.h"
+#include "bishengir/Dialect/Scope/IR/Scope.h"
 
 namespace mlir {
 namespace triton {
@@ -39,6 +45,19 @@ public:
 
   // Run the pass
   void runOnOperation() override;
+
+  [[nodiscard]] llvm::StringRef getArgument() const final {
+    return "split-dataflow";
+  }
+
+  /// Return the dialect that must be loaded in the context before this pass.
+  void getDependentDialects(::mlir::DialectRegistry &registry) const override {
+    registry.insert<hivm::HIVMDialect>();
+    registry.insert<bufferization::BufferizationDialect>();
+    registry.insert<scope::ScopeDialect>();
+    registry.insert<annotation::AnnotationDialect>();
+    registry.insert<LLVM::LLVMDialect>();
+  }
 };
 
 // Create the pass
