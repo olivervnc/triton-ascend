@@ -143,6 +143,7 @@ void AddDynamicCVPipelinePass::runOnOperation() {
 
     // Do not reuse pass instances or partially transformed IR on retry.
     PassManager pm(&getContext(), moduleOp.getOperationName());
+    (void)mlir::applyPassManagerCLOptions(pm);
     addPasses(pm, enableOuterMainLoop);
 
     // run passes in separate pm, instead of the pipeline to suppress reproducer
