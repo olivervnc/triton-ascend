@@ -1,6 +1,8 @@
 # Triton builds
 build/
 build-*/
+dist/
+triton_ascend-*/
 
 llvm-project/
 llvm-project-*/
