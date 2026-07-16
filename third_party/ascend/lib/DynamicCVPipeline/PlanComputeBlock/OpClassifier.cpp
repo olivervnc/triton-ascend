@@ -23,7 +23,6 @@
 #include <queue>
 
 #include "llvm/ADT/DenseSet.h"
-#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Casting.h"
 
@@ -35,15 +34,14 @@
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
-#include "mlir/Interfaces/CastInterfaces.h"
 #include "mlir/Interfaces/LoopLikeInterface.h"
-#include "mlir/Interfaces/ViewLikeInterface.h"
 #include "mlir/Support/LLVM.h"
 
 #include "ascend/include/DynamicCVPipeline/Common/Utils.h"
 #include "ascend/include/DynamicCVPipeline/PlanComputeBlock/OpClassifier.h"
 
 #include "bishengir/Dialect/Annotation/IR/Annotation.h"
+#include "bishengir/Dialect/HIVM/IR/HIVMImpl.h"
 #include "bishengir/Dialect/HIVM/Utils/Utils.h"
 #include "bishengir/Dialect/Utils/Util.h"
 
@@ -699,6 +697,23 @@ int OpClassifierPass::markRemainingAsVector() {
 
     if (opCoreTypes[op] == OP_UNDETERMINED && !isa<scf::YieldOp>(op)) {
       opCoreTypes[op] = OP_VECTOR_ONLY;
+    }
+
+    if (isa<scf::ForOp>(op) && op->hasAttr(hivm::ExtractLoadStoreAttr)) {
+      op->walk([this](Operation *nestedOp) {
+        opCoreTypes[nestedOp] = OP_VECTOR_ONLY;
+        for (auto operand : nestedOp->getOperands()) {
+          if (auto allocOp = llvm::dyn_cast_if_present<memref::AllocOp>(
+                  operand.getDefiningOp())) {
+            opCoreTypes[allocOp] = OP_VECTOR_ONLY;
+            for (auto *user : allocOp->getUsers()) {
+              if (llvm::isa<bufferization::ToTensorOp>(user)) {
+                opCoreTypes[user] = OP_VECTOR_ONLY;
+              }
+            }
+          }
+        }
+      });
     }
   }
 
