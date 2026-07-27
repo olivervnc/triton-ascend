@@ -55,11 +55,11 @@ add_triton_library(DynamicCVPipeline
   AllocMultiCache.cpp
   AddControlFlowCondition.cpp
   ${PLAN_COMPUTE_BLOCK_SRC_FILES}
-	${SPLIT_DATAFLOW_SRC_FILES}
+  ${SPLIT_DATAFLOW_SRC_FILES}
   ${SEPARATE_MEMORY_FROM_COMPUTE_SRC_FILES}
   ${ALLOC_MULTI_CACHE_SRCS_FILES}
   ${ADD_CONTROLFLOW_CONDITION_SRC_FILES}
-	RemoveAttributes.cpp
+  RemoveAttributes.cpp
 
   DEPENDS
   AddDynamicCVPipelinePassIncGen
