@@ -243,6 +243,22 @@ std::optional<int> getTightlyCoupledBufferId(Value allocVal);
 Value traceBackToMemrefAlloc(Value v);
 int getLoopCarriedArgIndex(Value operand, Block *block);
 
+CoreType getValueCoreType(Value value);
+
+// Helper: convert OpCoreType to string for IR attribute
+inline llvm::StringRef coreTypeToString(CoreType ct) {
+  switch (ct) {
+  case CUBE_ONLY:
+    return "CUBE";
+  case VECTOR_ONLY:
+    return "VECTOR";
+  case CUBE_AND_VECTOR:
+    return "CUBE_AND_VECTOR";
+  default:
+    return "UNDETERMINED";
+  }
+}
+
 } // namespace CVPipeline
 } // namespace mlir
 

@@ -25,10 +25,12 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/LogicalResult.h"
 
 #include "mlir/Analysis/AliasAnalysis.h"
 #include "mlir/Analysis/TopologicalSortUtils.h"
@@ -43,6 +45,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Operation.h"
+#include "mlir/Interfaces/InferIntRangeInterface.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Support/LLVM.h"
 #include "mlir/Support/WalkResult.h"
@@ -52,6 +55,7 @@
 #include "ascend/include/DynamicCVPipeline/PlanComputeBlock/ComputeBlockIdManager.h"
 
 #include "DynamicCVPipeline/Common/MemoryEffectsTracker.h"
+#include "DynamicCVPipeline/SplitDataflow/Utils.h"
 
 static constexpr const char *DEBUG_TYPE = "SplitIfByBlockId";
 #define DBGS() (llvm::dbgs() << '[' << DEBUG_TYPE << "] ")
@@ -78,7 +82,7 @@ namespace {
 /// One group of ops sharing the same block_id inside an scf.if.
 /// N=0: all storage is heap-allocated, keeping sizeof small.
 struct BlockGroup {
-  int64_t blockId;
+  int blockId;
   SmallVector<Operation *, 0> ops;     // ops in this group (original order)
   SmallVector<scf::IfOp, 0> nestedIfs; // nested ifs that belong to this group
 };
@@ -242,7 +246,7 @@ static SmallVector<BlockGroup> groupOpsInBlock(Block &block) {
   SmallVector<BlockGroup> groups;
   llvm::SmallDenseMap<int64_t, unsigned> idToIdx; // block_id -> index in groups
 
-  auto getOrCreateGroup = [&](int64_t bid) -> BlockGroup & {
+  auto getOrCreateGroup = [&](int bid) -> BlockGroup & {
     auto it = idToIdx.find(bid);
     if (it != idToIdx.end()) {
       return groups[it->second];
@@ -252,11 +256,11 @@ static SmallVector<BlockGroup> groupOpsInBlock(Block &block) {
     return groups.back();
   };
 
-  int64_t currentId = -1; // which group nested / ambient ops attach to
+  int currentId = -1; // which group nested / ambient ops attach to
   SmallVector<Operation *, 0>
       pendingAmbient; // ambient ops before first real group
 
-  auto flushPending = [&](int64_t targetBid) {
+  auto flushPending = [&](int targetBid) {
     if (pendingAmbient.empty()) {
       return;
     }
@@ -354,7 +358,8 @@ namespace {
 // Logic: find until the first scalar dependency
 class ScalarClosure {
 private:
-  Block *const block = nullptr;
+  Block *block = nullptr;
+  Block *parentBlock = nullptr;
   llvm::ArrayRef<Operation *> ops;
   llvm::ArrayRef<scf::IfOp> ifOps;
 
@@ -366,6 +371,9 @@ public:
   llvm::SmallPtrSet<Operation *, kExpectedMaxScalarOps> scalarOps;
   ScalarClosure(BlockGroup &group, ArrayRef<Operation *> ops);
   void collect();
+
+  // Safety: both operations must be in scalarOps
+  bool isBefore(Operation *a, Operation *b);
 };
 
 } // namespace
@@ -386,7 +394,17 @@ void ScalarClosure::collectScalarClosure(Value val) {
     return;
   }
   Operation *defOp = val.getDefiningOp();
-  if (!defOp || defOp->getBlock() != block) {
+  if (!defOp) {
+    // hard to determine - if scf ops have scalar/memref result, should we clone
+    // the op as well? Perhaps walk into the subregions and clone the
+    // corresponding ops would be better. But for now let's just clone them
+    return;
+  }
+
+  auto *defBlock = defOp->getBlock();
+  if (!defBlock || (defBlock != block &&
+                    // to prevent memref dependencies in main loop
+                    defBlock != parentBlock)) {
     return;
   }
 
@@ -405,8 +423,25 @@ void ScalarClosure::collect() {
 }
 
 ScalarClosure::ScalarClosure(BlockGroup &group, ArrayRef<Operation *> ops)
-    : block(group.ops.empty() ? nullptr : group.ops.front()->getBlock()),
-      ops(ops) {}
+    : ops(ops) {
+  if (group.ops.empty()) {
+    return;
+  }
+  block = group.ops.front()->getBlock();
+  Operation *parentOp = block->getParentOp();
+  if (!parentOp) {
+    return;
+  }
+  parentBlock = parentOp->getBlock();
+}
+
+bool ScalarClosure::isBefore(Operation *a, Operation *b) {
+  if (a->getBlock() == parentBlock || b->getBlock() == parentBlock) {
+    a = parentBlock->findAncestorOpInBlock(*a);
+    b = parentBlock->findAncestorOpInBlock(*b);
+  }
+  return a->isBeforeInBlock(b);
+}
 
 static void preprocessScalarDependencies(CandidateIf &cand) {
   auto processGroup = [](BlockGroup &group) {
@@ -414,24 +449,31 @@ static void preprocessScalarDependencies(CandidateIf &cand) {
     SmallVector<Operation *> allOps{allOpsIter.begin(), allOpsIter.end()};
     ScalarClosure closure{group, allOps};
     closure.collect();
+    if (closure.scalarOps.empty()) {
+      return;
+    }
 
     IRMapping mapper;
     SmallVector<Operation *, 4> opsToClone(closure.scalarOps.begin(),
                                            closure.scalarOps.end());
 
-    // sort the collected ops so that they are in the reversed order as in mlir
-    llvm::sort(opsToClone, [](Operation *a, Operation *b) {
-      return b->isBeforeInBlock(a);
+    // sort the collected ops so that they are in the same dominance order as in
+    // mlir
+    llvm::sort(opsToClone, [&closure](Operation *a, Operation *b) {
+      return closure.isBefore(a, b);
     });
 
     SmallVector<Operation *, 4> newOps;
-    for (Operation *scalarOp : closure.scalarOps) {
+
+    // Safety: closure not empty -> group.ops not empty
+    auto *firstOp = group.ops.front();
+    OpBuilder builder(firstOp);
+    builder.setInsertionPoint(firstOp);
+    for (Operation *scalarOp : opsToClone) {
       if (llvm::is_contained(group.ops, scalarOp)) {
         continue;
       }
 
-      OpBuilder builder(scalarOp);
-      builder.setInsertionPointAfter(scalarOp);
       Operation *cloned = builder.clone(*scalarOp, mapper);
       cloned->setAttr(
           CVPipeline::kBlockId,
@@ -934,7 +976,7 @@ static Value getRootTensor(Value v) {
 /// scf.if has no yield results to passthrough.
 /// When \p referenceValue traces to a function argument, the placeholder
 /// preserves that provenance instead of creating a fresh alloca.
-static Value createPlaceholderValue(int64_t blockId, OpBuilder &builder,
+static Value createPlaceholderValue(int blockId, OpBuilder &builder,
                                     Location loc, Type type,
                                     Value referenceValue = Value()) {
   Value result;
@@ -1170,10 +1212,15 @@ rewireAndMoveOps(BlockGroup &group,
   for (auto nestedIf : group.nestedIfs) {
     allOps.push_back(nestedIf.getOperation());
   }
+  if (allOps.empty()) {
+    return;
+  }
   llvm::sort(allOps,
              [](Operation *a, Operation *b) { return a->isBeforeInBlock(b); });
+  OpBuilder builder{allOps.front()};
   for (auto *op : allOps) {
     op->moveBefore(&targetBlock, targetBlock.end());
+    op->setAttr(CVPipeline::kBlockId, builder.getI32IntegerAttr(group.blockId));
   }
 }
 
@@ -1184,7 +1231,7 @@ rewireAndMoveOps(BlockGroup &group,
 /// Constants (arith::ConstantOp) are NOT cloned — the pre-created placeholder
 /// already dominates and cloning would perturb cross-group tracking.
 /// Other values are returned unchanged.
-static Value ensureLocalValue(int64_t blockId, Value val, Block &elseBlock,
+static Value ensureLocalValue(int blockId, Value val, Block &elseBlock,
                               OpBuilder &builder) {
   // Block arguments always dominate
   if (isa<BlockArgument>(val)) {
@@ -1211,23 +1258,6 @@ static Value ensureLocalValue(int64_t blockId, Value val, Block &elseBlock,
   }
 
   return val;
-}
-
-/// Create placeholders for a group's output types inside the else block.
-/// Each placeholder is created locally in the else block with block_id = -1.
-static SmallVector<Value, 4>
-buildElsePlaceholders(int64_t blockId, ArrayRef<Type> types,
-                      ArrayRef<Value> refValues, Block &elseBlock, Location loc,
-                      OpBuilder &builder) {
-  OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToEnd(&elseBlock);
-  SmallVector<Value, 4> result;
-  for (unsigned idx = 0; idx < types.size(); ++idx) {
-    Value ref = idx < refValues.size() ? refValues[idx] : Value();
-    result.push_back(
-        createPlaceholderValue(blockId, builder, loc, types[idx], ref));
-  }
-  return result;
 }
 
 /// Build then yield for a non-last group that produces output values.
@@ -1269,7 +1299,7 @@ static bool valueDominates(Value val, Block *block) {
 /// For other slots (pure cross-group augmentation, Case A, or when the
 /// original else value is defined inside the original else block and does
 /// not dominate the new split-if), creates placeholder values.
-static void buildElseYieldForGroup(const int64_t blockId,
+static void buildElseYieldForGroup(const int blockId,
                                    const GroupOutputInfo &output,
                                    Block &elseBlock, Location loc,
                                    OpBuilder &builder) {
@@ -1395,7 +1425,7 @@ static void buildThenYieldForLastIf(
 
 /// Build else yield for the last-if in Case B.
 /// Absorbs other-side ops (Scene 3/4) or creates placeholders.
-static void buildElseYieldForLastIf(int64_t blockId,
+static void buildElseYieldForLastIf(int blockId,
                                     const OtherSideContext &otherCtx,
                                     ArrayRef<Type> lastIfTypes,
                                     Block &elseBlock, Location loc,
@@ -1454,6 +1484,51 @@ static constexpr llvm::StringLiteral kSplittedIf = "ssbuffer.splitted_if";
 // ============================================================================
 // Part3: Materialization (orchestrator)
 // ============================================================================
+
+static scf::YieldOp safeGetTerminator(Block *block) {
+  if (!block) {
+    return nullptr;
+  }
+  return llvm::dyn_cast_if_present<scf::YieldOp>(block->getTerminator());
+}
+
+static void postProcess(scf::IfOp ifOp, scf::IfOp sourceIfOp, int blockId) {
+  OpBuilder builder{ifOp};
+
+  // clone attrs
+  ifOp->setAttrs(sourceIfOp->getAttrs());
+
+  // remap core types
+  auto thenYield = safeGetTerminator(ifOp.thenBlock());
+  if (thenYield && thenYield.getNumOperands() > 0) {
+    std::string joinedAttr =
+        llvm::join(llvm::map_range(thenYield.getOperands(),
+                                   [](Value value) {
+                                     CVPipeline::CoreType ct =
+                                         CVPipeline::getValueCoreType(value);
+                                     return CVPipeline::coreTypeToString(ct);
+                                   }),
+                   ", ");
+    ifOp->setAttr(CVPipeline::kCoreType, builder.getStringAttr(joinedAttr));
+  } else {
+    ifOp->removeAttr(CVPipeline::kCoreType);
+  }
+
+  // mark if and yields as the same block id
+  auto setBlockId = [&](Operation *op) {
+    op->setAttr(CVPipeline::kBlockId, builder.getI32IntegerAttr(blockId));
+  };
+  setBlockId(ifOp);
+  if (thenYield) {
+    setBlockId(thenYield);
+  }
+  if (auto elseYield = safeGetTerminator(ifOp.elseBlock())) {
+    setBlockId(elseYield);
+  }
+
+  // temporarily mark as splitted if
+  ifOp->setAttr(kSplittedIf, builder.getUnitAttr());
+}
 
 /// Materialization for Case A and Case B using per-group signatures.
 ///
@@ -1573,7 +1648,7 @@ static void materializeCandidate(CandidateIf &c, OpBuilder &builder,
       updateCrossValueReplacementGroup(output, splittedIf, thenBlock,
                                        crossValueReplacement);
     }
-    splittedIf->setAttr(kSplittedIf, builder.getUnitAttr());
+    postProcess(splittedIf, originalIf, groups[gi].blockId);
   }
 
   // Phase 2: Materialize the last group.
@@ -1658,7 +1733,7 @@ static void materializeCandidate(CandidateIf &c, OpBuilder &builder,
       builder.create<scf::YieldOp>(loc);
     }
   }
-  lastIf->setAttr(kSplittedIf, builder.getUnitAttr());
+  postProcess(lastIf, originalIf, groups[lastGi].blockId);
 
   // Erase the original if.
   originalIf->erase();
@@ -1850,10 +1925,6 @@ namespace triton {
 
 std::unique_ptr<OperationPass<ModuleOp>> createSplitIfByBlockIdPass() {
   return std::make_unique<SplitIfByBlockIdPass>();
-}
-
-void registerSplitIfByBlockIdPass() {
-  registerPass(createSplitIfByBlockIdPass);
 }
 
 } // namespace triton
