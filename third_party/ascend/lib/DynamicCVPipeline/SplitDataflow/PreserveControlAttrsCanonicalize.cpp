@@ -73,7 +73,12 @@ public:
     if (Operation *newOp = findReplacementOp(op, values)) {
       transferAttrs(op, newOp);
     }
-    transferBlockIdToInsertedReplacementDefs(op, values);
+
+    for (Value value : values) {
+      if (Operation *defOp = value.getDefiningOp()) {
+        transferBlockIdToInsertedReplacement(op, defOp);
+      }
+    }
   }
 
 private:
@@ -136,26 +141,6 @@ private:
     }
 
     to->setAttr(CVPipeline::kBlockId, blockId);
-  }
-
-  void transferBlockIdToInsertedReplacementDefs(Operation *from,
-                                                ValueRange replacements) const {
-    if (!from || !isTrackedControlFlowOp(from)) {
-      return;
-    }
-
-    for (Value value : replacements) {
-      if (!value) {
-        continue;
-      }
-
-      Operation *defOp = value.getDefiningOp();
-      if (!defOp) {
-        continue;
-      }
-
-      transferBlockIdToInsertedReplacement(from, defOp);
-    }
   }
 
   llvm::SetVector<Operation *> recentInserts;
