@@ -56,6 +56,7 @@
 #include "ascend/include/DynamicCVPipeline/PlanComputeBlock/ComputeBlockIdManager.h"
 
 #include "Common.h"
+#include "bishengir/Dialect/HIVM/IR/HIVM.h"
 
 static constexpr const char *DEBUG_TYPE = "SplitIfByBlockId";
 #define DBGS() (llvm::dbgs() << '[' << DEBUG_TYPE << "] ")
@@ -790,9 +791,10 @@ static Value getRootTensor(Value v) {
 /// scf.if has no yield results to passthrough.
 /// When \p referenceValue traces to a function argument, the placeholder
 /// preserves that provenance instead of creating a fresh alloca.
-static llvm::FailureOr<Value>
-createPlaceholderValue(int blockId, OpBuilder &builder, Location loc, Type type,
-                       Value referenceValue = Value()) {
+static llvm::FailureOr<Value> createPlaceholderValue(int blockId,
+                                                     OpBuilder &builder,
+                                                     Location loc, Type type,
+                                                     Value referenceValue) {
   Value result;
   bool usedTrace = false;
   if (auto tensorType = dyn_cast<RankedTensorType>(type)) {
@@ -1045,8 +1047,7 @@ static Value ensureLocalValue(int blockId, Value val, Block &elseBlock,
     return val;
   }
 
-  if (isa<ViewLikeOpInterface>(defOp) ||
-      isa<memref::AllocOp, memref::AllocaOp>(defOp)) {
+  if (isa<ViewLikeOpInterface>(defOp)) {
     OpBuilder::InsertionGuard guard(builder);
     builder.setInsertionPointToEnd(&elseBlock);
     auto *cloned = builder.clone(*defOp);

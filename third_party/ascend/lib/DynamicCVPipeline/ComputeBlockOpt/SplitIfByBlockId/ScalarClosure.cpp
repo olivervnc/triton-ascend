@@ -1,6 +1,8 @@
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/Support/Casting.h"
 #include "llvm/Support/Debug.h"
 
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/IRMapping.h"
 
 #include "Common.h"
@@ -30,7 +32,7 @@ void ScalarClosure::collectScalarClosure(Value val) {
     return;
   }
   Operation *defOp = val.getDefiningOp();
-  if (!defOp) {
+  if (!defOp || llvm::isa<memref::AllocOp, memref::AllocaOp>(defOp)) {
     return;
   }
 
