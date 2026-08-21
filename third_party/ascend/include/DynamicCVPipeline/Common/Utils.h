@@ -272,8 +272,6 @@ inline llvm::StringRef coreTypeToString(CoreType ct) {
   }
 }
 
-CoreType getValueCoreType(Value value);
-
 inline OpOperand *getTiedYieldOperand(Value value, Block *block) {
   int argIdx = getLoopCarriedArgIndex(value, block);
   if (argIdx == -1) {
