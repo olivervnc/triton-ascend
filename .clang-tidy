@@ -1,0 +1,112 @@
+# 全库扫描建议匹配所有头文件（排除 third_party build/外部依赖按实际情况调整）
+HeaderFilterRegex: '.*'
+
+Checks:
+  # 默认关闭所有
+  - -*
+
+  # ==========================================
+  # 1. 深度静态分析 (Clang Analyzer - 耗时高但价值极高)
+  # ==========================================
+  - clang-analyzer-*
+  # 剔除 analyzer 中针对 C 风格字符串或过度偏执的部分噪音
+  - -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling
+
+  # ==========================================
+  # 2. 基础编译器诊断 (Base Diagnostics)
+  # ==========================================
+  - clang-diagnostic-*
+
+  # ==========================================
+  # 3. 致命错误与代码缺陷 (Bugprone)
+  # ==========================================
+  - bugprone-*
+  # 致命缺陷专项保留 (虽然 bugprone-* 已经包含，但列出作为硬性要求)
+  - bugprone-use-after-move
+  - bugprone-sizeof-expression
+  - bugprone-dangling-handle
+  - bugprone-unchecked-optional-access
+  - bugprone-unhandled-self-assignment
+  - bugprone-branch-clone
+  - bugprone-macro-parentheses
+  - bugprone-integer-division
+  - bugprone-undefined-memory-manipulation
+  - bugprone-virtual-near-miss
+  # 剔除 MLIR/Triton 中的高噪音项
+  - -bugprone-easily-swappable-parameters          # MLIR builder/helper 中连续同类型参数极多
+  - -bugprone-implicit-widening-of-multiplication-result # Tensor 形状计算中过于繁琐
+  - -bugprone-narrowing-conversions                # 形状/步长转型噪音大
+
+  # ==========================================
+  # 4. 性能优化 (Performance)
+  # ==========================================
+  - performance-*
+  - -performance-enum-size
+
+  # ==========================================
+  # 5. 现代化 C++ (Modernize)
+  # ==========================================
+  - modernize-*
+  - -modernize-use-trailing-return-type          # 剔除：耗时且属于代码风格
+  - -modernize-macro-to-enum                    # 剔除：不强制宏转枚举
+  - -modernize-use-nodiscard                    # 剔除：全库扫会产生海量 nodiscard 提示
+  - -modernize-avoid-c-arrays                   # 剔除：底层硬件/算子交互常有 C 数组
+  - -modernize-use-auto                         # 剔除：MLIR 中类型显式声明更利于阅读
+
+  # ==========================================
+  # 6. 代码健壮性与可读性 (Readability - 已剔除风格/命名/常量/auto*)
+  # ==========================================
+  - readability-*
+  # --- 明确关闭 auto* 强加规则 ---
+  - -readability-qualified-auto                 # 关闭：强制 auto 必须写成 auto*
+  - -llvm-qualified-auto                        # 关闭：别名项
+
+  # --- 明确关闭命名、常量与风格项 ---
+  - -readability-identifier-naming              # 关闭：命名风格
+  - -readability-identifier-length              # 关闭：变量名长度
+  - -readability-magic-numbers                  # 关闭：魔数/常数检查
+  - -readability-implicit-bool-conversion       # 关闭：允许 ptr / Handle 隐式转 bool
+  - -readability-braces-around-statements       # 关闭：交由 clang-format 处理
+  - -readability-function-cognitive-complexity  # 关闭：复杂算子/IR 生成函数免受认知复杂度限制
+  - -readability-function-size                  # 关闭：Pass/Pattern 函数往往很长
+  - -readability-else-after-return              # 关闭：风格偏好
+  - -readability-convert-member-functions-to-static # 关闭：Pass/Pattern 中常常保留成员函数签名
+  # --- 保留高价值的健壮性检查 ---
+  - readability-redundant-smartptr-get
+  - readability-redundant-string-cstr
+  - readability-container-size-empty
+  - readability-redundant-member-init
+
+  # ==========================================
+  # 7. C++ 核心指南 (CppCoreGuidelines - 针对 MLIR 内存模型优化)
+  # ==========================================
+  - cppcoreguidelines-avoid-capture-default-when-dangling
+  - cppcoreguidelines-interfaces-global-init
+  - cppcoreguidelines-slicing
+  - cppcoreguidelines-special-member-functions
+  - cppcoreguidelines-prefer-member-initializer
+  - cppcoreguidelines-explicit-virtual-functions
+  # --- 明确剔除指针/内存/类型转换噪音 ---
+  - -cppcoreguidelines-owning-memory            # 关闭：MLIR 对象归 Context 管理，不使用 owning 指针
+  - -cppcoreguidelines-pro-bounds-*             # 关闭：允许指针算术与数组下标
+  - -cppcoreguidelines-pro-type-*               # 关闭：允许 reinterpret_cast 与底层类型转换
+  - -cppcoreguidelines-macro-usage              # 关闭：不要检查宏常数
+  - -cppcoreguidelines-no-malloc                # 关闭：底层通信/内存管理允许原生分配
+
+  # ==========================================
+  # 8. 杂项 (Misc - 去噪)
+  # ==========================================
+  - misc-*
+  - -misc-unused-parameters                     # 关闭：MLIR Pattern/Pass 签名存在大量未用参数
+  - -misc-non-private-member-variables-in-classes # 关闭：AST/IR 数据结构常有 public 成员
+  - -misc-const-correctness                     # 关闭：全库扫描极慢且误报率高
+  - -misc-include-cleaner                       # 关闭：与 TableGen 自动生成头文件冲突
+  - -misc-no-recursion                          # 关闭：IR 遍历本质上就是递归的
+  - -misc-use-anonymous-namespace
+  - -misc-confusable-identifiers
+  - -misc-unused-using-decls
+
+  # ==========================================
+  # 9. 安全标准与并发 (CERT & Concurrency)
+  # ==========================================
+  - cert-dcl50-cpp
