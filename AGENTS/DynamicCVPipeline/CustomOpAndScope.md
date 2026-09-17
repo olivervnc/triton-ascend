@@ -2,7 +2,9 @@
 
 ## 1. 概述与背景
 - **相关 Pass 与文件**:
-  - `OpClassifierPass::groupCustomOps`: `third_party/ascend/lib/DynamicCVPipeline/PlanComputeBlock/OpClassifier.cpp`
+  - `PackMemrefPass` (`--ssbuf-standardize-op-pack-memref`): `third_party/ascend/lib/DynamicCVPipeline/StandardizeOp/PackMemref.cpp`
+    - CustomOp 分组（含 `CustomOpAnalysis` / `packScopeOp`）与 load 单元打包均在此 Pass 完成（由 `OpClassifierPass::groupCustomOps` 迁移而来，见第 5 节）。
+  - `OpClassifierPass`: `third_party/ascend/lib/DynamicCVPipeline/PlanComputeBlock/OpClassifier.cpp`（仅消费 scope 上已有的 `ssbuffer.core_type`，不再做分组）
   - `UnpackScopePass` (`--ssbuf-unpack-scopeop`): `third_party/ascend/lib/DynamicCVPipeline/SplitDataflow/UnpackScopePass.cpp`
   - 分析与工具库:
     - `third_party/ascend/include/DynamicCVPipeline/Common/Analysis.h` / `CustomOpUtils.cpp`
@@ -69,3 +71,25 @@
    - 插入点位于集合中最后一个算子（`ops.back()`），外部用户必须位于其后。若 customOp 结果直接作为 `scf.yield` 的操作数，必须确保插入点与块终止符之间的有效放置顺序。
 3. **属性复用保护**:
    - 解包时不能盲目使用 `op->setAttrs(attrs)` 覆盖所有内部算子，否则会擦除 `hivm.hir.custom` 上的 `symbol`、`bitcode`、`hivm.pipe` 等专用方言属性。仅在算子原有属性为空或仅含旧 `block_id` 时可直接整组复用。
+
+---
+
+## 5. 职责迁移：CustomOp 分组从 OpClassifier 迁至 PackMemref
+
+### 旧版方案 vs 新版方案
+| 维度 | 旧版 | 新版 |
+| :--- | :--- | :--- |
+| **分组时机** | `OpClassifierPass::groupCustomOps`（PlanComputeBlock 阶段）动态创建 `scope.scope` | `PackMemrefPass`（StandardizeOp 阶段）统一创建 |
+| **分类来源** | 分组后立即在内存 `opCoreTypes` 里写死，IR 上无持久标记 | 分组同时把 `ssbuffer.core_type` 落到 scope op 上 |
+| **分类消费者** | 仅本 Pass 内部使用 | `OpClassifierPass` 读取该属性并**尊重**它，把 scope 当作原子边界，不再向下传播 |
+| **依赖前置** | 无（per-pass 自洽） | 要求 StandardizeOp 阶段先于 PlanComputeBlock 阶段运行 |
+
+### 新增：load 单元打包
+- 针对 `%a = memref.alloc() -> <作用于 %a 的算子> -> %b = bufferization.to_tensor %a`（`%a` 可能经 `subview` / `reinterpret_cast`），在 `PackMemrefPass::packLoadUnit` 中打包为 `scope::ScopeOp` 并打上 `ssbuffer.load`（`CVPipeline::kScopeLoadAttr`）。
+- `<作用于 %a 的算子>` 上溯到所在 block 的顶层算子后，必须满足「是带 `hivm::ExtractLoadStoreAttr` 的 loop」或「其所在 region 仅含该单个算子」，否则放弃打包。
+- 需随包的 `subview` / `reinterpret_cast` / 标量通过 `SplitIf::CollectScalarClosureForBlockGroup` 收集：**有 scope 外消费者则克隆**（克隆体插在 scope 之前），否则直接并入 scope。
+- 若该 load 单元由 `ExtractedLoadOrStore` loop 驱动，则 scope 直接标记 `ssbuffer.core_type = "VECTOR"`（`ExtractedLoadOrStore` 恒为 Vector 核），其余 load scope 不带 core_type，交由 `OpClassifierPass` 依 matmul 消费关系判定为 CUBE。
+
+### 调试陷阱
+- `ScalarClosure` 持有 `ArrayRef<Operation*>`，不可将其实例跨作用域带出；外部（如 `PackMemrefPass`）一律通过按值返回的 `CollectScalarClosureForBlockGroup` 使用。
+- `packScopeOp` 不校验支配关系，调用方必须保证打包列表按 SSA 拓扑序、且所有逃逸值的使用者位于 `ops.back()` 之后。

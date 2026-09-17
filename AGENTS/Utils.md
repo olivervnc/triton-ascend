@@ -183,6 +183,22 @@ llvm::LogicalResult unpackScopeOp(scope::ScopeOp scopeOp, llvm::SmallVectorImpl<
 - **Location**: `third_party/ascend/include/DynamicCVPipeline/Common/ScopeOpUtils.h:48` / `ScopeOpUtils.cpp:84`
 - **Purpose**: Moves all operations inside `scopeOp` body to the parent block immediately before `scopeOp`, replaces uses of `scopeOp` results with the terminator's operands, and erases `scopeOp`. Optionally populates `movedOps`.
 
+### `ScalarClosure` / `CollectScalarClosureForBlockGroup`
+```cpp
+class ScalarClosure; // mlir::CVPipeline, header only
+namespace mlir::CVPipeline::SplitIf {
+using ScalarOps = llvm::SmallPtrSet<Operation *, ScalarClosure::kExpectedMaxScalarOps>;
+ScalarOps CollectScalarClosureForBlockGroup(BlockGroup &group);
+}
+```
+- **Location**:
+  - 类声明：`third_party/ascend/include/DynamicCVPipeline/Common/ScalarClosure.h`
+  - 类实现（`collectOuterDependency` / `collectScalarClosure` / `collect` / 构造函数 / `isBefore` / `capture`）：`third_party/ascend/lib/DynamicCVPipeline/Common/ScalarClosure.cpp`
+  - `CollectScalarClosureForBlockGroup` 实现（原地保留的安全入口）：`third_party/ascend/lib/DynamicCVPipeline/ComputeBlockOpt/SplitIfByBlockId/ScalarClosure.cpp`
+  - 声明：`third_party/ascend/lib/DynamicCVPipeline/ComputeBlockOpt/SplitIfByBlockId/Common.h`
+- **Purpose**: `ScalarClosure` 沿 SSA 逐级收集「直到第一个张量依赖」之前的标量/视图算子（`subview` / `reinterpret_cast` / 索引标量），结果存于 `scalarOps`。
+  `CollectScalarClosureForBlockGroup(BlockGroup&)` 是**原地保留**的安全入口：内部构造 `ScalarClosure(block, group.ops, /*includeParent=*/true)`、`collect()`，并**按值返回** `ScalarOps`。之所以不直接暴露 `ScalarClosure` 对象，是因为它持有 `ArrayRef<Operation*>`（`ArrayRef` 指向 `group.ops`）/ `Block*` 引用，一旦调用方传入临时容器或 `BlockGroup` 先析构，就会产生悬垂引用；按值返回彻底规避该问题。`PackMemrefPass` 的 load 打包即通过它收集需要随 scope 一并处理的算子。
+
 ### `getAliasSource` / `traceMemDef`
 ```cpp
 Value getAliasSource(Value val);
