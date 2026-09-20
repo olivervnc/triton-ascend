@@ -84,4 +84,17 @@ def CheckUnsupportedScenarioPass : Pass<"ssbuf-check-unsupported-scenario", "mli
   let dependentDialects = ["memref::MemRefDialect"];
 }
 
+def StaticCVPipelinePass : Pass<"static-cv-pipeline", "mlir::ModuleOp"> {
+  let summary = "Static CV pipeline optimization pass";
+  let constructor = "triton::createStaticCVPipelinePass()";
+  let dependentDialects = [
+    "scope::ScopeDialect",
+    "hivm::HIVMDialect",
+    "annotation::AnnotationDialect",
+    "memref::MemRefDialect",
+    "arith::ArithDialect",
+    "scf::SCFDialect"
+  ];
+}
+
 #endif // TRITON_DYNAMIC_CV_PIPELINE_PASSES

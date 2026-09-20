@@ -74,6 +74,8 @@ inline constexpr llvm::StringLiteral kForMayNotExec =
 inline constexpr llvm::StringLiteral kClone = "ssbuffer.clone";
 inline constexpr llvm::StringLiteral kInsertionOptimization =
     "ssbuffer.insertionOptimization";
+inline constexpr llvm::StringLiteral kStaticCVPipeline =
+    "ssbuffer.static_cv_pipeline";
 inline constexpr llvm::StringLiteral kArg = "ssbuffer.arg";
 inline constexpr llvm::StringLiteral kWhileArg = "ssbuffer.while_arg";
 static constexpr llvm::StringLiteral kInlinableQuantScaleAttr =

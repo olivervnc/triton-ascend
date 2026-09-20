@@ -253,6 +253,14 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
     moduleop->setAttr(CVPipeline::kInsertionOptimization,
                       builder.getUnitAttr());
   });
+  m.def("set_enable_static_cv_pipeline", [](mlir::ModuleOp &moduleop) {
+    OpBuilder builder(moduleop.getContext());
+    moduleop->setAttr(CVPipeline::kStaticCVPipeline,
+                      builder.getUnitAttr());
+  });
+  m.def("static_cv_pipeline", [](PassManager &pm) {
+    pm.addPass(createStaticCVPipelinePass());
+  });
 }
 
 #if TRITON_ASCEND_HAS_INPROC_COSTMODEL
