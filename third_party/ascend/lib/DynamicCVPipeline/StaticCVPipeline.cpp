@@ -160,55 +160,6 @@ DenseMap<int, scope::ScopeOp> packBlocks(Block &block,
   return scopeOps;
 }
 
-struct ForWithAddArgs {
-  scf::ForOp forOp;
-  llvm::SmallVector<BlockArgument> extraBargs;
-};
-
-ForWithAddArgs addIterArgsToFor(mlir::scf::ForOp oldForOp,
-                                ValueRange newInitValues) {
-  mlir::Location loc = oldForOp.getLoc();
-  llvm::SmallVector<mlir::Value> newInits(oldForOp.getInitArgs());
-  newInits.append(newInitValues.begin(), newInitValues.end());
-
-  IRRewriter rewriter(oldForOp);
-  auto numNewVals = newInitValues.size();
-
-  auto newForOp = rewriter.create<mlir::scf::ForOp>(
-      loc, oldForOp.getLowerBound(), oldForOp.getUpperBound(),
-      oldForOp.getStep(), newInits,
-      [&](mlir::OpBuilder &b, mlir::Location l, mlir::Value iv,
-          mlir::ValueRange iterArgs) {
-        mlir::IRMapping mapping;
-        mapping.map(oldForOp.getInductionVar(), iv);
-
-        for (auto [oldArg, newArg] :
-             llvm::zip(oldForOp.getRegionIterArgs(),
-                       iterArgs.drop_back(numNewVals))) {
-          mapping.map(oldArg, newArg);
-        }
-
-        auto *oldYield = oldForOp.getBody()->getTerminator();
-        for (auto &op : oldForOp.getBody()->without_terminator()) {
-          b.clone(op, mapping);
-        }
-
-        llvm::SmallVector<mlir::Value> newYieldOperands;
-        for (mlir::Value oldYieldOperand : oldYield->getOperands()) {
-          newYieldOperands.push_back(mapping.lookupOrDefault(oldYieldOperand));
-        }
-        newYieldOperands.append(newInitValues.begin(), newInitValues.end());
-
-        b.create<mlir::scf::YieldOp>(l, newYieldOperands);
-      });
-
-  rewriter.replaceOp(oldForOp, newForOp.getResults().drop_back(numNewVals));
-
-  llvm::SmallVector<BlockArgument> extraBargs(
-      newForOp.getRegionIterArgs().take_back(numNewVals));
-  return {newForOp, std::move(extraBargs)};
-}
-
 /// Helper to clone a scopeOp with flag delta and tightly coupled buffer
 /// replacements.
 /// flagDelta = 0: even iteration (+0 flag, original tcb buffer)
@@ -342,6 +293,7 @@ public:
         }
       }
 
+      // Pack blocks into scopeOps only AFTER addIterArgsToFor so that scopeOp bodies are not emptied/lost
       SmallVector<int> blockOrder;
       auto scopeOps = packBlocks(*forOp.getBody(), blockOrder);
       if (scopeOps.empty()) {
@@ -370,6 +322,26 @@ public:
       if (prologueScopes.empty() || epilogueScopes.empty()) {
         LDBG("Missing prologue or epilogue blocks, skipping static pipeline");
         return WalkResult::advance();
+      }
+
+      DenseSet<Operation *> epiScopeSet;
+      for (auto s : epilogueScopes)
+        epiScopeSet.insert(s.getOperation());
+
+      SmallVector<Value> proToEpiValues;
+      for (auto proScope : prologueScopes) {
+        for (auto res : proScope.getResults()) {
+          for (auto *user : res.getUsers()) {
+            Operation *topUser = user;
+            while (topUser->getParentOp() && topUser->getParentOp() != forOp) {
+              topUser = topUser->getParentOp();
+            }
+            if (epiScopeSet.contains(topUser)) {
+              proToEpiValues.push_back(res);
+              break;
+            }
+          }
+        }
       }
 
       OpBuilder builder(forOp);
@@ -412,27 +384,6 @@ public:
         tcbOddBufferMap[allocRes] = oddAlloc.getResult();
       });
 
-      // Analyze intra-core data dependencies from Prologue to Epilogue
-      DenseSet<Operation *> epiScopeSet;
-      for (auto s : epilogueScopes)
-        epiScopeSet.insert(s.getOperation());
-
-      SmallVector<Value> proToEpiValues;
-      for (auto proScope : prologueScopes) {
-        for (auto res : proScope.getResults()) {
-          for (auto *user : res.getUsers()) {
-            Operation *topUser = user;
-            while (topUser->getParentOp() && topUser->getParentOp() != forOp) {
-              topUser = topUser->getParentOp();
-            }
-            if (epiScopeSet.contains(topUser)) {
-              proToEpiValues.push_back(res);
-              break;
-            }
-          }
-        }
-      }
-
       // Loop constants
       Value lb = forOp.getLowerBound();
       Value ub = forOp.getUpperBound();
@@ -468,13 +419,62 @@ public:
       extraInits.push_back(zero); // counter init
       extraInits.append(prePrologueOutputs.begin(), prePrologueOutputs.end());
 
-      auto forResults = addIterArgsToFor(forOp, extraInits);
-      forOp = forResults.forOp;
-      forOp.setUpperBound(newUb);
+      // Save mapping from old scope ops inside old forOp to their counterparts in new forOp
+      DenseMap<scope::ScopeOp, scope::ScopeOp> oldToNewScopeMap;
 
-      BlockArgument counterArg = forResults.extraBargs.front();
+      // Create new ForOp while preserving ScopeOps in the body
+      mlir::Location forLoc = forOp.getLoc();
+      llvm::SmallVector<mlir::Value> newInits(forOp.getInitArgs());
+      newInits.append(extraInits.begin(), extraInits.end());
+
+      IRRewriter rewriter(forOp);
+      auto numNewVals = extraInits.size();
+
+      auto newForOp = rewriter.create<mlir::scf::ForOp>(
+          forLoc, forOp.getLowerBound(), newUb, forOp.getStep(), newInits,
+          [&](mlir::OpBuilder &b, mlir::Location l, mlir::Value iv,
+              mlir::ValueRange iterArgs) {
+            mlir::IRMapping mapping;
+            mapping.map(forOp.getInductionVar(), iv);
+
+            for (auto [oldArg, newArg] :
+                 llvm::zip(forOp.getRegionIterArgs(),
+                           iterArgs.drop_back(numNewVals))) {
+              mapping.map(oldArg, newArg);
+            }
+
+            auto *oldYield = forOp.getBody()->getTerminator();
+            for (auto &op : forOp.getBody()->without_terminator()) {
+              auto *clonedOp = b.clone(op, mapping);
+              if (auto oldScope = dyn_cast<scope::ScopeOp>(&op)) {
+                oldToNewScopeMap[oldScope] = cast<scope::ScopeOp>(clonedOp);
+              }
+            }
+
+            llvm::SmallVector<mlir::Value> newYieldOperands;
+            for (mlir::Value oldYieldOperand : oldYield->getOperands()) {
+              newYieldOperands.push_back(mapping.lookupOrDefault(oldYieldOperand));
+            }
+            newYieldOperands.append(extraInits.begin(), extraInits.end());
+
+            b.create<mlir::scf::YieldOp>(l, newYieldOperands);
+          });
+
+      rewriter.replaceOp(forOp, newForOp.getResults().drop_back(numNewVals));
+      forOp = newForOp;
+
+      // Update prologueScopes and epilogueScopes to point to the cloned ScopeOps in newForOp
+      for (auto &proScope : prologueScopes) {
+        proScope = oldToNewScopeMap.lookup(proScope);
+      }
+      for (auto &epiScope : epilogueScopes) {
+        epiScope = oldToNewScopeMap.lookup(epiScope);
+      }
+
+      BlockArgument counterArg = forOp.getRegionIterArgs().drop_front(
+          forOp.getRegionIterArgs().size() - extraInits.size()).front();
       ArrayRef<BlockArgument> proToEpiIterArgs =
-          ArrayRef<BlockArgument>(forResults.extraBargs).drop_front(1);
+          ArrayRef<BlockArgument>(forOp.getRegionIterArgs().take_back(proToEpiValues.size()));
 
       // --- Inside Main Loop ---
       builder.setInsertionPointToStart(forOp.getBody());
