@@ -908,6 +908,15 @@ void UpdateConditionInfoPass::runOnOperation() {
           info->tensorIterArgIndicesMap[cubeForOp];
       info->tensorIterArgIndicesMap.erase(cubeForOp);
     }
+    if (intraCoreBuffersMap.count(cubeForOp)) {
+      intraCoreBuffersMap[newCubeForOp] = intraCoreBuffersMap[cubeForOp];
+      intraCoreBuffersMap.erase(cubeForOp);
+    }
+    if (info->intraCoreDependentMap.count(cubeForOp)) {
+      info->intraCoreDependentMap[newCubeForOp] =
+          info->intraCoreDependentMap[cubeForOp];
+      info->intraCoreDependentMap.erase(cubeForOp);
+    }
     cubeForOp.erase();
     cubeForOp = newCubeForOp;
   }
@@ -955,6 +964,15 @@ void UpdateConditionInfoPass::runOnOperation() {
       info->tensorIterArgIndicesMap[newVectorForOp] =
           info->tensorIterArgIndicesMap[vectorForOp];
       info->tensorIterArgIndicesMap.erase(vectorForOp);
+    }
+    if (intraCoreBuffersMap.count(vectorForOp)) {
+      intraCoreBuffersMap[newVectorForOp] = intraCoreBuffersMap[vectorForOp];
+      intraCoreBuffersMap.erase(vectorForOp);
+    }
+    if (info->intraCoreDependentMap.count(vectorForOp)) {
+      info->intraCoreDependentMap[newVectorForOp] =
+          info->intraCoreDependentMap[vectorForOp];
+      info->intraCoreDependentMap.erase(vectorForOp);
     }
     vectorForOp.erase();
     vectorForOp = newVectorForOp;

@@ -463,6 +463,12 @@ static LogicalResult
 insertPipeSForMainLoopOp(Operation *loopOp, scope::ScopeOp scopeOp,
                          bool isScopeCube, bool isScopeVector, PipeAttr setPipe,
                          PipeAttr waitPipe, int flagId) {
+  // scf.for uses scalar lockstep emulation without SSBuffer, so inter-core
+  // PIPE_S synchronization is not needed and would serialize the pipeline.
+  if (isa<scf::ForOp>(loopOp)) {
+    return success();
+  }
+
   Block *loopBody = getMainLoopBody(loopOp);
   Location loc = loopOp->getLoc();
   bool isVectorFirst = loopOp->hasAttr(CVPipeline::kVectorFirst);
