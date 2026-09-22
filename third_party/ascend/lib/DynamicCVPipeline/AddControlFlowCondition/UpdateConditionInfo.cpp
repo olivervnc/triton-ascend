@@ -544,34 +544,14 @@ void UpdateConditionInfoPass::collectCrossCoreTokenConditions(
   }
 }
 
-int UpdateConditionInfoPass::setFlowOptCondition(scf::IfOp currentIfOp,
-                                                 Operation *loopOp,
-                                                 Value counter,
-                                                 Value &flowOptCond) {
-  flowOptCond = nullptr;
-  auto forOp = dyn_cast<scf::ForOp>(loopOp);
-  if (!forOp)
-    return UPDATE_CONDITION_INFO_SUCCESS;
-
-  if (!info->flowOptIfOpPairs.count(currentIfOp))
-    return UPDATE_CONDITION_INFO_SUCCESS;
-
-  if (info->crossCoreBufferCount <= CROSS_CORE_BUFFER_COUNT_THRESHOLD ||
-      info->intraCoreBufferCount <= INTRA_CORE_BUFFER_COUNT_THRESHOLD) {
-    return UPDATE_CONDITION_INFO_SUCCESS;
+static Value buildFlowOptCondition(OpBuilder &builder, Location loc,
+                                   scf::ForOp forOp, Value srcCounterToUse,
+                                   int intraCoreBufferCount,
+                                   int crossCoreBufferCount) {
+  if (crossCoreBufferCount <= CROSS_CORE_BUFFER_COUNT_THRESHOLD ||
+      intraCoreBufferCount <= INTRA_CORE_BUFFER_COUNT_THRESHOLD) {
+    return nullptr;
   }
-
-  scf::IfOp sourceIfOp = info->flowOptIfOpPairs[currentIfOp];
-  if (!info->cntArgs.count(sourceIfOp)) {
-    return UPDATE_CONDITION_INFO_SUCCESS;
-  }
-
-  Value srcCounter = info->cntArgs[sourceIfOp];
-  Value srcCounterToUse =
-      getLatestValue(controlVarToLatestValue, srcCounter);
-
-  OpBuilder builder(currentIfOp);
-  Location loc = currentIfOp.getLoc();
 
   Value lowerBound = forOp.getLowerBound();
   Value upperBound = forOp.getUpperBound();
@@ -582,10 +562,10 @@ int UpdateConditionInfoPass::setFlowOptCondition(scf::IfOp currentIfOp,
                     .getResult();
 
   int optInt =
-      std::min(info->intraCoreBufferCount - 1, info->crossCoreBufferCount);
+      std::min(intraCoreBufferCount - 1, crossCoreBufferCount);
   auto stepIntType = dyn_cast<IntegerType>(step.getType());
   if (!stepIntType)
-    return UPDATE_CONDITION_INFO_FAILED;
+    return nullptr;
 
   Value optNum = builder.create<arith::ConstantIntOp>(
                             loc, optInt, stepIntType.getWidth())
@@ -598,8 +578,7 @@ int UpdateConditionInfoPass::setFlowOptCondition(scf::IfOp currentIfOp,
                                               srcCounterToUse, lowerPlusOffset)
                     .getResult();
 
-  flowOptCond = builder.create<arith::OrIOp>(loc, cond1, cond2).getResult();
-  return UPDATE_CONDITION_INFO_SUCCESS;
+  return builder.create<arith::OrIOp>(loc, cond1, cond2).getResult();
 }
 
 scf::IfOp UpdateConditionInfoPass::createRealIfOp(
@@ -705,6 +684,7 @@ scf::IfOp UpdateConditionInfoPass::createDummyIfOp(
   scf::IfOp newIfOp = builder.create<scf::IfOp>(loc, resultTypes, combinedCond,
                                                 /*withElse=*/true);
   newIfOp->setAttr(CVPipeline::kIf, builder.getI32IntegerAttr(blockId));
+  newIfOp->setAttr(CVPipeline::kDummy, builder.getUnitAttr());
 
   // Then block: empty compute body, update usedVars and counter
   Block *thenBlock = newIfOp.thenBlock();
@@ -861,6 +841,30 @@ void UpdateConditionInfoPass::runOnOperation() {
     vectorIfInfos.push_back(infoOp);
   }
 
+  // Map flowOpt pairs to source indices within the same core
+  for (size_t i = 0; i < cubeIfInfos.size(); ++i) {
+    if (info->flowOptIfOpPairs.count(cubeIfInfos[i].ifOp)) {
+      scf::IfOp srcIf = info->flowOptIfOpPairs[cubeIfInfos[i].ifOp];
+      for (size_t s = 0; s < cubeIfInfos.size(); ++s) {
+        if (cubeIfInfos[s].ifOp == srcIf) {
+          cubeIfInfos[i].flowOptSourceIndex = s;
+          break;
+        }
+      }
+    }
+  }
+  for (size_t j = 0; j < vectorIfInfos.size(); ++j) {
+    if (info->flowOptIfOpPairs.count(vectorIfInfos[j].ifOp)) {
+      scf::IfOp srcIf = info->flowOptIfOpPairs[vectorIfInfos[j].ifOp];
+      for (size_t s = 0; s < vectorIfInfos.size(); ++s) {
+        if (vectorIfInfos[s].ifOp == srcIf) {
+          vectorIfInfos[j].flowOptSourceIndex = s;
+          break;
+        }
+      }
+    }
+  }
+
   // Rebuild Cube loop with extra iter_args
   scf::ForOp newCubeForOp = cubeForOp;
   unsigned oldCubeNumArgs = cubeForOp ? cubeForOp.getNumRegionIterArgs() : 0;
@@ -979,20 +983,25 @@ void UpdateConditionInfoPass::runOnOperation() {
     Value step = newCubeForOp.getStep();
     Location loc = newCubeForOp.getLoc();
 
+    SmallVector<Value> cubeCounters;
+    for (size_t i = 0; i < cubeIfInfos.size(); ++i) {
+      Value c = nullptr;
+      if (info->blockCounters.count(newCubeForOp) &&
+          i < info->blockCounters[newCubeForOp].size()) {
+        int argIdx = info->blockCounters[newCubeForOp][i];
+        c = newCubeForOp.getRegionIterArgs()[argIdx];
+      }
+      cubeCounters.push_back(c);
+    }
+
     // 1. Process Real Cube IfOps
     for (size_t i = 0; i < cubeIfInfos.size(); ++i) {
       auto &infoOp = cubeIfInfos[i];
       scf::IfOp ifOp = infoOp.ifOp;
       OpBuilder builder(ifOp);
 
-      Value counter = nullptr;
-      bool hasCounter = false;
-      if (info->blockCounters.count(newCubeForOp) &&
-          i < info->blockCounters[newCubeForOp].size()) {
-        int argIdx = info->blockCounters[newCubeForOp][i];
-        counter = newCubeForOp.getRegionIterArgs()[argIdx];
-        hasCounter = true;
-      }
+      Value counter = cubeCounters[i];
+      bool hasCounter = (counter != nullptr);
 
       SmallVector<Value> conditions;
       DenseSet<Value> usedVarsSet;
@@ -1027,10 +1036,19 @@ void UpdateConditionInfoPass::runOnOperation() {
         conditions.push_back(counterCond);
       }
 
-      Value flowOptCond = nullptr;
-      (void)setFlowOptCondition(ifOp, newCubeForOp, counter, flowOptCond);
-      if (flowOptCond)
-        conditions.push_back(flowOptCond);
+      if (infoOp.flowOptSourceIndex != -1 &&
+          infoOp.flowOptSourceIndex < (int)cubeCounters.size()) {
+        Value srcCounter = cubeCounters[infoOp.flowOptSourceIndex];
+        if (srcCounter) {
+          Value srcCounterToUse =
+              getLatestValue(controlVarToLatestValue, srcCounter);
+          Value flowOptCond = buildFlowOptCondition(
+              builder, ifOp.getLoc(), newCubeForOp, srcCounterToUse,
+              info->intraCoreBufferCount, info->crossCoreBufferCount);
+          if (flowOptCond)
+            conditions.push_back(flowOptCond);
+        }
+      }
 
       Value combinedCond;
       if (conditions.empty()) {
@@ -1104,6 +1122,20 @@ void UpdateConditionInfoPass::runOnOperation() {
         conditions.push_back(counterCond);
       }
 
+      if (infoOp.flowOptSourceIndex != -1 &&
+          infoOp.flowOptSourceIndex < (int)shadowVectorCounters.size()) {
+        Value srcCounter = shadowVectorCounters[infoOp.flowOptSourceIndex];
+        if (srcCounter) {
+          Value srcCounterToUse =
+              getLatestValue(controlVarToLatestValue, srcCounter);
+          Value flowOptCond = buildFlowOptCondition(
+              dummyBuilder, loc, newCubeForOp, srcCounterToUse,
+              info->intraCoreBufferCount, info->crossCoreBufferCount);
+          if (flowOptCond)
+            conditions.push_back(flowOptCond);
+        }
+      }
+
       Value combinedCond;
       if (conditions.empty()) {
         combinedCond =
@@ -1129,7 +1161,6 @@ void UpdateConditionInfoPass::runOnOperation() {
       if (hasCounter) {
         controlVarToLatestValue[shadowCounter] =
             newDummyIfOp.getResult(usedVars.size());
-        info->cntArgs[newDummyIfOp] = shadowCounter;
       }
     }
 
@@ -1196,6 +1227,20 @@ void UpdateConditionInfoPass::runOnOperation() {
         conditions.push_back(counterCond);
       }
 
+      if (infoOp.flowOptSourceIndex != -1 &&
+          infoOp.flowOptSourceIndex < (int)shadowCubeCounters.size()) {
+        Value srcCounter = shadowCubeCounters[infoOp.flowOptSourceIndex];
+        if (srcCounter) {
+          Value srcCounterToUse =
+              getLatestValue(controlVarToLatestValue, srcCounter);
+          Value flowOptCond = buildFlowOptCondition(
+              dummyBuilder, loc, newVectorForOp, srcCounterToUse,
+              info->intraCoreBufferCount, info->crossCoreBufferCount);
+          if (flowOptCond)
+            conditions.push_back(flowOptCond);
+        }
+      }
+
       Value combinedCond;
       if (conditions.empty()) {
         combinedCond =
@@ -1221,8 +1266,18 @@ void UpdateConditionInfoPass::runOnOperation() {
       if (hasCounter) {
         controlVarToLatestValue[shadowCounter] =
             newDummyIfOp.getResult(usedVars.size());
-        info->cntArgs[newDummyIfOp] = shadowCounter;
       }
+    }
+
+    SmallVector<Value> vectorCounters;
+    for (size_t j = 0; j < vectorIfInfos.size(); ++j) {
+      Value c = nullptr;
+      if (info->blockCounters.count(newVectorForOp) &&
+          j < info->blockCounters[newVectorForOp].size()) {
+        int argIdx = info->blockCounters[newVectorForOp][j];
+        c = newVectorForOp.getRegionIterArgs()[argIdx];
+      }
+      vectorCounters.push_back(c);
     }
 
     // 2. Process Real Vector IfOps
@@ -1231,14 +1286,8 @@ void UpdateConditionInfoPass::runOnOperation() {
       scf::IfOp ifOp = infoOp.ifOp;
       OpBuilder builder(ifOp);
 
-      Value counter = nullptr;
-      bool hasCounter = false;
-      if (info->blockCounters.count(newVectorForOp) &&
-          j < info->blockCounters[newVectorForOp].size()) {
-        int argIdx = info->blockCounters[newVectorForOp][j];
-        counter = newVectorForOp.getRegionIterArgs()[argIdx];
-        hasCounter = true;
-      }
+      Value counter = vectorCounters[j];
+      bool hasCounter = (counter != nullptr);
 
       SmallVector<Value> conditions;
       DenseSet<Value> usedVarsSet;
@@ -1273,10 +1322,19 @@ void UpdateConditionInfoPass::runOnOperation() {
         conditions.push_back(counterCond);
       }
 
-      Value flowOptCond = nullptr;
-      (void)setFlowOptCondition(ifOp, newVectorForOp, counter, flowOptCond);
-      if (flowOptCond)
-        conditions.push_back(flowOptCond);
+      if (infoOp.flowOptSourceIndex != -1 &&
+          infoOp.flowOptSourceIndex < (int)vectorCounters.size()) {
+        Value srcCounter = vectorCounters[infoOp.flowOptSourceIndex];
+        if (srcCounter) {
+          Value srcCounterToUse =
+              getLatestValue(controlVarToLatestValue, srcCounter);
+          Value flowOptCond = buildFlowOptCondition(
+              builder, ifOp.getLoc(), newVectorForOp, srcCounterToUse,
+              info->intraCoreBufferCount, info->crossCoreBufferCount);
+          if (flowOptCond)
+            conditions.push_back(flowOptCond);
+        }
+      }
 
       Value combinedCond;
       if (conditions.empty()) {

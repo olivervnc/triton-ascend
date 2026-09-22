@@ -161,8 +161,10 @@ static bool isRunFirst(SmallVector<scf::IfOp> &ifOps,
 // Returns true if the IfOp should be collected, false otherwise
 using IfOpFilter = std::function<bool(scf::IfOp)>;
 
-// Default filter that accepts all IfOps
-static bool defaultIfOpFilter(scf::IfOp ifOp) { return true; }
+// Default filter that accepts all non-dummy IfOps
+static bool defaultIfOpFilter(scf::IfOp ifOp) {
+  return !ifOp->hasAttr(CVPipeline::kDummy);
+}
 
 // Filter that checks if IfOp contains sync_block_wait or sync_block_set op
 static bool syncBlockFilter(scf::IfOp ifOp) {
@@ -999,6 +1001,9 @@ int UpdateLoopIterTimesPass::replaceForOpCounterInIfOps() {
 
       // Find all ifOps with ssbuffer.if attribute inside this mainloop
       forOp.walk([&](scf::IfOp ifOp) {
+        if (ifOp->hasAttr(CVPipeline::kDummy)) {
+          return WalkResult::advance();
+        }
         if (ifOp->hasAttr(CVPipeline::kIf)) {
           if (!info->cntArgs.count(ifOp)) {
             LDBG("ifblock has no counter in cntArgs");
@@ -1097,6 +1102,9 @@ int UpdateLoopIterTimesPass::ComputeMainLoopTimes(
         return -1;
       }
       for (auto &[ifOp, cntVal] : info->cntArgs) {
+        if (ifOp->hasAttr(CVPipeline::kDummy)) {
+          continue;
+        }
         if (ifOp->hasAttr(CVPipeline::kIf)) {
           auto parentOp = ifOp->getParentOp();
           if (parentOp->hasAttr(CVPipeline::kMainLoop) &&

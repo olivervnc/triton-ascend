@@ -60,6 +60,7 @@ struct IfOpInfo {
   // Intra-core buffer group indices consumed / produced
   SmallVector<int> intraCoreInputValues;
   SmallVector<int> intraCoreOutputValues;
+  int flowOptSourceIndex = -1; // index of source IfOp within the same core
 };
 
 class UpdateConditionInfoPass
@@ -138,9 +139,6 @@ private:
       OpBuilder &builder, Location loc, scf::IfOp ifOp,
       SmallVector<Value> &conditions, DenseSet<Value> &usedVarsSet,
       DenseMap<Value, VarUpdateType> &varUpdateTypes);
-
-  int setFlowOptCondition(scf::IfOp currentIfOp, Operation *loopOp,
-                          Value counter, Value &flowOptCond);
 
   // Cross-core conditions using scalar iter_arg tokens (no SSBuffer!)
   void collectCrossCoreTokenConditions(
