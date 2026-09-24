@@ -547,11 +547,11 @@ CoreType getValueCoreType(Value value) {
 
 Value getAliasSource(Value value) {
   if (auto barg = dyn_cast<BlockArgument>(value)) {
-    if (isa<func::FuncOp>(barg.getOwner()->getParentOp())) {
+    auto parentOp = barg.getOwner()->getParentOp();
+    if (isa<func::FuncOp>(parentOp)) {
       return nullptr;
     }
-    // we do not expect blockargs to carry memrefs, but to avoid core dumps in
-    // mem effects tracker in case ...
+    LOG_DEBUG("Warning: " << *parentOp << " carries memref bargs!" << "\n");
     return nullptr;
   }
   return llvm::TypeSwitch<Operation *, Value>(value.getDefiningOp())

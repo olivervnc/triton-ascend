@@ -289,8 +289,7 @@ void OpClassifierPass::matchTransposePattern(Operation *def) {
       return false;
     return (isa<bufferization::BufferizationDialect>(opDef->getDialect()) &&
             !isa<bufferization::AllocTensorOp>(opDef)) ||
-           isa<tensor::EmptyOp, hivm::ConvertLayoutOp, tensor::ReshapeOp>(
-               opDef);
+           isa<tensor::EmptyOp>(opDef);
   };
 
   // Check input tensor
@@ -1704,38 +1703,30 @@ int OpClassifierPass::handleCubeAndVector() {
 }
 
 static OpCoreType fromCoreType(CoreType ct) {
-  using namespace mlir;
-  using namespace CVPipeline;
   switch (ct) {
   case CUBE_ONLY:
-    return mlir::triton::OP_CUBE_ONLY;
+    return OP_CUBE_ONLY;
   case VECTOR_ONLY:
-    return mlir::triton::OP_VECTOR_ONLY;
+    return OP_VECTOR_ONLY;
   case CUBE_AND_VECTOR:
-    return mlir::triton::OP_CUBE_AND_VECTOR;
+    return OP_CUBE_AND_VECTOR;
   case UNDETERMINED:
-    return mlir::triton::OP_UNDETERMINED;
+    return OP_UNDETERMINED;
   }
 }
 
 llvm::LogicalResult OpClassifierPass::groupCustomOps() {
-  llvm::SmallVector<CustomOpAnalysis> customOps;
-  auto walkResult = getOperation().walk<WalkOrder::PreOrder>(
-      [this, &customOps](hivm::CustomOp customOp) {
-        auto anaRes = CustomOpAnalysis::get(customOp);
-        if (llvm::failed(anaRes)) {
-          return WalkResult::interrupt();
-        }
-        auto &ana = anaRes.value();
-        customOps.push_back(std::move(ana));
-        return WalkResult::advance();
-      });
+  llvm::SmallVector<hivm::CustomOp> customOps;
+  getOperation().walk(
+      [&customOps](hivm::CustomOp customOp) { customOps.push_back(customOp); });
 
-  if (walkResult.wasInterrupted()) {
-    return llvm::failure();
-  }
-
-  for (auto &ana : customOps) {
+  for (auto customOp : customOps) {
+    auto anaRes = CustomOpAnalysis::get(customOp);
+    if (llvm::failed(anaRes)) {
+      LOG_DEBUG("Warning: failed to analyze " << customOp << "\n");
+      continue;
+    }
+    auto &ana = anaRes.value();
     auto coreType = fromCoreType(ana.coreType);
     LOG_DEBUG("Packing: " << ana.customOp << "\n");
     for (auto *op : ana.relaventOps) {
@@ -1745,7 +1736,7 @@ llvm::LogicalResult OpClassifierPass::groupCustomOps() {
     auto scopeOp = packScopeOp(ana.relaventOps);
     if (!scopeOp) {
       LOG_DEBUG("Failed to pack ScopeOp: "
-                << scopeOp << "; fallback to default behaviour.\n");
+                << customOp << "; fallback to default behaviour.\n");
       continue;
     }
     allOps.push_back(scopeOp);
@@ -1946,6 +1937,7 @@ void OpClassifierPass::runOnOperation() {
   }
 
   if (groupCustomOps().failed()) {
+    // currently unreachable to expose all possible incorrect handling
     CVPipeline::setFallbackAttr(module, CVPipeline::ERRCODE_FAILED);
     return;
   }
