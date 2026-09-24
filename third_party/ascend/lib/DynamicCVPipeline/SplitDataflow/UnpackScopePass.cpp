@@ -39,8 +39,8 @@
 #include "bishengir/Dialect/Scope/IR/Scope.h"
 
 static constexpr const char *DEBUG_TYPE = "SplitDataflow";
-#define DBGS() (llvm::dbgs() << '[' << DEBUG_TYPE << "] ")
-#define LDBG(X) LLVM_DEBUG(DBGS() << (X) << "\n")
+#define DBGS(...) LLVM_DEBUG(llvm::dbgs() << __VA_ARGS__)
+#define LOG_DEBUG(...) DBGS("[" << DEBUG_TYPE << "] " << __VA_ARGS__)
 
 using namespace mlir;
 using namespace CVPipeline;
@@ -65,6 +65,7 @@ public:
       llvm::SmallVector<Operation *> unpackedOps;
       auto attrs = scopeOp->getAttrs();
       if (unpackScopeOp(scopeOp, &unpackedOps).failed()) {
+        LOG_DEBUG("Failed to unpack scopeOp: " << scopeOp << "\n");
         return WalkResult::interrupt();
       }
       for (auto *op : unpackedOps) {
