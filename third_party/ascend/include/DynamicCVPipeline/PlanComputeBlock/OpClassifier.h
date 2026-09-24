@@ -196,7 +196,6 @@ private:
   // Helper: Mark fill operations as CUBE when their output buffer is CUBE
   void markFillOpsAsCube();
 
-  // Step 7.5: Group load ops into scope
   LogicalResult groupCustomOps();
 
   // Step 8: Stamp core type info to IR

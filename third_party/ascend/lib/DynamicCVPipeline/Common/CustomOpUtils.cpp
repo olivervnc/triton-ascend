@@ -44,8 +44,7 @@ void CustomOpAnalysis::determineCoreType() {
     case hivm::TCoreType::VECTOR:
       coreType = VECTOR_ONLY;
       break;
-    case hivm::TCoreType::CUBE_AND_VECTOR:
-    case hivm::TCoreType::CUBE_OR_VECTOR:
+    default:
       coreType = CUBE_AND_VECTOR;
     }
   }

@@ -216,19 +216,16 @@ static EffectsTy collectOuterEffects(Operation *op, bool &unknown,
       })
       .Case([](bufferization::AllocTensorOp) { return EffectsTy{}; })
       .Case([](bufferization::ToTensorOp toTensorOp) -> EffectsTy {
-        MemoryEffects::EffectInstance scopedWrite(MemoryEffects::Read::get());
-        return {remapEffectValue(scopedWrite, toTensorOp.getBuffer())};
+        MemoryEffects::EffectInstance scopedRead(MemoryEffects::Read::get());
+        return {remapEffectValue(scopedRead, toTensorOp.getBuffer())};
       })
       .Case([&](hivm::CustomOp customOp) -> EffectsTy {
         EffectsTy effects;
-        // for (auto op : customOp.getOperands()) {
-        //   MemoryEffects::EffectInstance scopedWrite(
-        //       MemoryEffects::Write::get());
-        //   effects.push_back(remapEffectValue(scopedWrite, op));
-        // }
-        // return effects;
         auto anaRes = CustomOpAnalysis::get(customOp);
         if (llvm::failed(anaRes)) {
+          LOG_DEBUG("Warning: failed to analyze "
+                    << customOp
+                    << "; conservatively treat all operands as read.\n");
           for (auto operand : customOp.getOperands()) {
             if (isa<MemRefType>(operand.getType())) {
               MemoryEffects::EffectInstance scopedWrite(
@@ -240,8 +237,8 @@ static EffectsTy collectOuterEffects(Operation *op, bool &unknown,
         }
         auto &ana = anaRes.value();
         for (auto buf : ana.getReads()) {
-          MemoryEffects::EffectInstance scopedWrite(MemoryEffects::Read::get());
-          effects.push_back(remapEffectValue(scopedWrite, buf));
+          MemoryEffects::EffectInstance scopedRead(MemoryEffects::Read::get());
+          effects.push_back(remapEffectValue(scopedRead, buf));
         }
         for (auto buf : ana.getWrites()) {
           MemoryEffects::EffectInstance scopedWrite(
