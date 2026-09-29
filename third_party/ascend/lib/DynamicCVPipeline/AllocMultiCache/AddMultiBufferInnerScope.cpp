@@ -123,54 +123,6 @@ static int getForOpPriority(scf::ForOp f) {
   return 0;
 }
 
- // Collect a single dependency value to depValueMap. Same-block check uses
- // outermost id so inner ops of a multi-region op (e.g. subview at block 3
- // inside ifOp at block 4) are not treated as cross-block consumers of a
- // same-block producer.
- //
- // i1Found is set to true when the operand is a tensor with element type i1,
- // signaling the caller to fall back (set ERRCODE_IGNORED + signalPassFailure)
- // rather than process the dep through the multi-buffer pipeline. The operand
- // is intentionally NOT added to depValueMap in that case.
- // i1 return is done temporarily.
-
- static void collectDepValue(Value operand, Block *body, Operation *currentOp,
-                             DenseMap<Value, int> &outputToBlockId,
-                             DenseMap<Value, SmallVector<Value>> &depValueMap,
-                             Value groupKey, bool &i1Found) {
-   if (auto barg = dyn_cast<BlockArgument>(operand)) {
-     if (barg.getOwner() == body &&
-         !llvm::is_contained(depValueMap[groupKey], barg))
-       depValueMap[groupKey].push_back(barg);
-     return;
-   }
-
-   if (!outputToBlockId.count(operand))
-     return;
-
-   auto currentOutermost = getOutermostSsbufferId(currentOp);
-   auto operandOutermost = getOutermostSsbufferId(operand.getDefiningOp());
-
-   if (currentOutermost.has_value() && currentOutermost == operandOutermost)
-     return;
-
-   // i1 tensor deps: trigger fallback only for cross-block deps that are
-   // actually about to be multi-buffered. Same-block i1 tensors (e.g. a
-   // condition operand of an arith.select inside the same block) are
-   // filtered out by the same-block check above and never enter the
-   // multi-buffer pipeline, so they do not need the fallback.
-   if (auto shapedType = dyn_cast<ShapedType>(operand.getType())) {
-     if (shapedType.getElementType().isInteger(1)) {
-       i1Found = true;
-       return;
-     }
-   }
-
-   if (!llvm::is_contained(depValueMap[groupKey], operand))
-     depValueMap[groupKey].push_back(operand);
- }
-
-
 // Recursively find a nested main_loop (forOp / whileOp) inside `loop`'s body
 static Operation *findNestedMainloop(const MainLoop &loop) {
   SmallVector<Operation *> allOps;
@@ -1344,8 +1296,7 @@ static void insertWhileCounterOps(const MainLoop &mainLoop) {
 }
 
 static int addInnerMultiBuffer(MainLoop mainLoop, OpBuilder &builder,
-                               scope::ScopeOp vectorScope, int &groupId,
-                               bool &i1Found) {
+                               scope::ScopeOp vectorScope, int &groupId) {
   OpBuilder globalBuilder(mainLoop.getContext());
 
   // Two-phase dep collection for empty+fill cloning:
@@ -1388,7 +1339,7 @@ static int addInnerMultiBuffer(MainLoop mainLoop, OpBuilder &builder,
   }
 
   DenseSet<Value> phase1ClonedDepVals;
-  if (runDepAnalysisAndClone(mainLoop, globalBuilder, i1Found, blocks,
+  if (runDepAnalysisAndClone(mainLoop, globalBuilder, blocks,
                              depValueMap, allOps, phase1ClonedDepVals) != 0)
     return -1;
 
@@ -1399,16 +1350,8 @@ static int addInnerMultiBuffer(MainLoop mainLoop, OpBuilder &builder,
   blocks.clear();
   depValueMap.clear();
   allOps.clear();
-  if (collectInnerBlockInfo(mainLoop, blocks, depValueMap, allOps, i1Found) !=
-      0)
+  if (collectInnerBlockInfo(mainLoop, blocks, depValueMap, allOps) != 0)
     return -1;
-
-  // Phase 2 may surface i1 tensor deps that the clone introduced (e.g. a
-  // cloned scalar chain reaching a producer-side i1 tensor). Abort here too.
-  if (i1Found) {
-    LDBG("i1 tensor dep found in Phase 2, falling back");
-    return -1;
-  }
 
   if (blocks.empty())
     return -1;
@@ -1525,15 +1468,7 @@ void AddMultiBufferInnerScopePass::runOnOperation() {
         LDBG("Nested main_loop found, this is not allowed");
         return WalkResult::interrupt();
       }
-      // i1Found is reset per main_loop so it only triggers fallback for
-      // the current scope's deps.
-      bool i1Found = false;
-      int ret = addInnerMultiBuffer(mainLoop, builder, scope, groupId, i1Found);
-      if (i1Found) {
-        LDBG("i1 tensor dep found, setting fallback attribute");
-        CVPipeline::setFallbackAttr(module, CVPipeline::ERRCODE_IGNORED);
-        return WalkResult::interrupt();
-      }
+      int ret = addInnerMultiBuffer(mainLoop, builder, scope, groupId);
       if (ret != 0) {
         LDBG(
             "addInnerMultiBuffer failed for main_loop; signaling pass failure");
