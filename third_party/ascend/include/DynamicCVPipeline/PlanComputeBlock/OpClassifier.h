@@ -40,6 +40,7 @@
 
 #include "bishengir/Dialect/Annotation/IR/Annotation.h"
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
+#include "bishengir/Dialect/Scope/IR/Scope.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
 namespace mlir {
@@ -74,6 +75,10 @@ public:
     return "Classify operations as CUBE or VECTOR for dynamic CV pipeline";
   }
   ::llvm::StringRef getName() const override { return "OpClassifierPass"; }
+
+  void getDependentDialects(::mlir::DialectRegistry &registry) const override {
+    registry.insert<scope::ScopeDialect>();
+  }
 
 private:
   llvm::DenseMap<Operation *, Operation *> CloneOpMap;
