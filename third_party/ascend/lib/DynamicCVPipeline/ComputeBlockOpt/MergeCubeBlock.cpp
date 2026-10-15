@@ -218,8 +218,7 @@ MergeCubeBlockPass::performMerging(BlockDependencyGraph &graph,
     }
   }
 
-  // Preserve merges performed in earlier loop bodies.
-  mergedAny |= mergeCount > 0;
+  mergedAny = mergeCount > 0;
 
   LDBG("Merged " << mergeCount << " blocks\n");
 
