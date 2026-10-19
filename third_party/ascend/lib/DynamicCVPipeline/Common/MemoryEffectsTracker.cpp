@@ -522,6 +522,7 @@ void MemoryDependenceGraph::applyEffects(
     if (isa<BaseMemRefType>(result.getType())) {
       if (MemSlot *s = getOrCreateSlot(result)) {
         s->dataSource = op;
+        s->lastWriter = op;
         s->pendingReads.clear();
       }
     }
