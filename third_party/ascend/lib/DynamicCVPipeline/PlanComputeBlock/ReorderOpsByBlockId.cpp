@@ -57,7 +57,7 @@
 #include "bishengir/Dialect/HIVM/Utils/Utils.h"
 
 using namespace mlir;
-static constexpr const char *DEBUG_TYPE = "reorder-ops-by-block-id";
+static constexpr const char *DEBUG_TYPE = "ReorderOpsByBlockIdPass";
 
 #define DBGS(...) LLVM_DEBUG(llvm::dbgs() << __VA_ARGS__)
 #define LOG_DEBUG(...) DBGS("[" << DEBUG_TYPE << "] " << __VA_ARGS__)
