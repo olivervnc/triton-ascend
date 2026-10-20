@@ -60,8 +60,7 @@
 
 using namespace llvm;
 using namespace mlir;
-using namespace triton;
-using namespace CVSplit;
+using namespace CVPipeline;
 
 static constexpr const char *DEBUG_TYPE = "SplitMatmul";
 #define LOG_DEBUG(...)                                                         \
