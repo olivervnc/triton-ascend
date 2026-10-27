@@ -10,7 +10,6 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/LogicalResult.h"
 
-#include "bishengir/Dialect/HIVM/IR/HIVM.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -30,11 +29,13 @@
 #include "mlir/IR/Visitors.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "mlir/Interfaces/ViewLikeInterface.h"
+#include "mlir/Support/LLVM.h"
 
 #include "ascend/include/DynamicCVPipeline/Common/Utils.h"
 #include "ascend/include/DynamicCVPipeline/PlanComputeBlock/Common.h"
 
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
+#include "bishengir/Dialect/Scope/IR/Scope.h"
 
 static constexpr const char *DEBUG_TYPE = "dynamic-cv-pipeline-utils";
 #define DBGS(...) LLVM_DEBUG(llvm::dbgs() << __VA_ARGS__)
@@ -215,6 +216,11 @@ static CoreType getCoreTypeOfSimpleOpOrCfImpl(Operation *op) {
 CoreType getCoreTypeOfSimpleOpOrCf(Operation *op) {
   if (op == nullptr) {
     return CoreType::UNDETERMINED;
+  }
+  // A packed scope is an atomic unit carrying its authoritative core type;
+  // never re-derive it by walking the (deliberately unclassified) body.
+  if (llvm::isa<scope::ScopeOp>(op)) {
+    return getOpCoreType(op);
   }
   if (!llvm::isa<RegionBranchOpInterface>(op)) {
     return getOpCoreType(op);
@@ -437,17 +443,20 @@ SmallVector<Value> MainLoop::getBeforeIterArgs() const {
 
 MainLoop::MainLoop(Operation *loopOp) {
   op = loopOp;
-  if (auto f = dyn_cast<scf::ForOp>(loopOp))
+  if (auto f = dyn_cast<scf::ForOp>(loopOp)) {
     body = f.getBody();
-  else if (auto w = dyn_cast<scf::WhileOp>(loopOp))
+  } else if (auto w = dyn_cast<scf::WhileOp>(loopOp)) {
     body = w.getAfterBody();
+  }
 }
 
 scf::YieldOp MainLoop::getLoopYieldOp(Operation *loopOp) {
-  if (auto forOp = dyn_cast<scf::ForOp>(loopOp))
+  if (auto forOp = dyn_cast<scf::ForOp>(loopOp)) {
     return dyn_cast<scf::YieldOp>(forOp.getBody()->getTerminator());
-  if (auto whileOp = dyn_cast<scf::WhileOp>(loopOp))
+  }
+  if (auto whileOp = dyn_cast<scf::WhileOp>(loopOp)) {
     return dyn_cast<scf::YieldOp>(whileOp.getAfter().front().getTerminator());
+  }
   return {};
 }
 
@@ -505,24 +514,29 @@ int getTensorIterArgIndex(Value v, ArrayRef<Value> iterArgs) {
 }
 
 std::optional<hivm::FixpipePreQuantMode> getFixpipePreQuantMode(Operation *op) {
-  if (!isa<arith::TruncFOp, arith::TruncIOp>(op))
+  if (!isa<arith::TruncFOp, arith::TruncIOp>(op)) {
     return std::nullopt;
+  }
 
   // Exclude scalars: only shaped types are valid for fixpipe pre_quant.
   auto resultType = dyn_cast<ShapedType>(op->getResult(0).getType());
-  if (!resultType)
+  if (!resultType) {
     return std::nullopt;
+  }
 
   Type inElemType =
       cast<ShapedType>(op->getOperand(0).getType()).getElementType();
   Type outElemType = resultType.getElementType();
 
-  if (isa<Float32Type>(inElemType) && isa<BFloat16Type>(outElemType))
+  if (isa<Float32Type>(inElemType) && isa<BFloat16Type>(outElemType)) {
     return hivm::FixpipePreQuantMode::F322BF16;
-  if (isa<Float32Type>(inElemType) && isa<Float16Type>(outElemType))
+  }
+  if (isa<Float32Type>(inElemType) && isa<Float16Type>(outElemType)) {
     return hivm::FixpipePreQuantMode::F322F16;
-  if (inElemType.isInteger(32) && outElemType.isInteger(8))
+  }
+  if (inElemType.isInteger(32) && outElemType.isInteger(8)) {
     return hivm::FixpipePreQuantMode::S322I8;
+  }
   return std::nullopt;
 }
 
@@ -664,6 +678,23 @@ Operation *getLoopCarriedDefOp(Value argValue, Block *block) {
 
   Operation *origin = getLoopCarriedOrigin(updateOperand->get());
   return origin ? getAncestorInBlock(origin, block) : nullptr;
+}
+
+Value getAliasSource(Value value) {
+  if (auto barg = dyn_cast<BlockArgument>(value)) {
+    auto parentOp = barg.getOwner()->getParentOp();
+    if (isa<func::FuncOp>(parentOp)) {
+      return nullptr;
+    }
+    LOG_DEBUG("Warning: " << *parentOp << " carries memref bargs!" << "\n");
+    return nullptr;
+  }
+  return llvm::TypeSwitch<Operation *, Value>(value.getDefiningOp())
+      .Case([](ViewLikeOpInterface viewOp) { return viewOp.getViewSource(); })
+      .Case([](bufferization::ToTensorOp toTensor) {
+        return toTensor.getBuffer();
+      })
+      .Default([](auto) { return nullptr; });
 }
 
 } // namespace CVPipeline
