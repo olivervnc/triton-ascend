@@ -40,9 +40,11 @@
 - **关联算子收集 (`collectRelaventOps`)**:
   - 模式 1 (`buf.hasOneUse()`): `alloc -> to_tensor -> customOp`；
   - 模式 2 (写 buffer): `alloc` 被 `customOp` 写入，随后由单一 `to_tensor` 消费；
-  - 若 `to_tensor` 单一用户为 `hivm.ConvertLayoutOp`，一并纳入待打包集合；
+  - 若 `to_tensor` 单一用户为 `hivm.ConvertLayoutOp`，一并纳入待打包集合（`ConvertLayoutOp` 是 **tensor/memref 双语义**：ODS 为 `TensorOrMemref:$source` / `TensorOrMemref:$result`，故 `to_tensor -> convert_layout` 的 tensor 形态合法；树里其它 UT 只出现 memref 形态，勿据此判定该分支不可达，UT 必须用 tensor 形态）。
+  - 两个放弃打包的前置条件：本地 buffer 有**第二个** `to_tensor` 消费者（打包会撕开活跃值），或 operand 溯源到非 `func` 的 block arg（如 `scf.for` iter_arg，`collectBuffers` 直接 failure -> 该 customOp 整体不打包）。两例均有 UT 固定（`test_pack_memref.mlir` section 6/7）。
 - **核心类型映射 (`determineCoreType`)**:
-  读取 `hivm.tcore_type` 属性，对应映射为 `CUBE_ONLY`、`VECTOR_ONLY` 或 `CUBE_AND_VECTOR`。
+  读取 `hivm.tcore_type` 属性，对应映射为 `CUBE_ONLY`、`VECTOR_ONLY` 或 `CUBE_AND_VECTOR`。注意 `hivm::TCoreType` 实际有 4 个值（`CUBE=1`、`VECTOR=2`、`CUBE_OR_VECTOR=3`、`CUBE_AND_VECTOR=4`），`switch` 的 `default` 会把 **3 和 4 一起**归为 `CUBE_AND_VECTOR` -> 两者都会触发 `OpClassifierPass::handleCubeAndVector` 的双核分裂，`CUBE_OR_VECTOR` 因此被过度分裂（单核即可）。
+- **"打 core_type" == 预分类，不是提示**: `PackMemrefPass::packCustomOpUnit` 无条件落 `ssbuffer.core_type`（未识别 tcore_type 时为 `"UNDETERMINED"`），而 `OpClassifierPass::initializePass` 把**任何**带该属性的算子塞进 `preClassifiedOps`（此后不再染色），只有 `OP_CUBE_AND_VECTOR` 会被分裂，`OP_UNDETERMINED` 最终被末尾循环强制成 VECTOR -> "不打属性让 OpClassifier 染色"与"打 UNDETERMINED"并不等价，是两种不同结果。 **对 UT 的后果**：输入 IR 里预置 `ssbuffer.core_type` 的旧用例不再测依赖传播——预置即权威，`memref.copy` 不会再被下游 CUBE 染色（`test_plan_compute_block_subview_memory_deps.mlir` 因此必须去掉预置属性）。
 
 ### Step 2: 封装 Scope (`packScopeOp`)
 - 在待打包算子集合末尾插入 `scope::ScopeOp`；
