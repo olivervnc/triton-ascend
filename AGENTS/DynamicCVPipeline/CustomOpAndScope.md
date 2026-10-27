@@ -37,12 +37,14 @@
   通过 `traceMemDef(operand)` 穿透 `ViewLikeOpInterface` 和 `bufferization::ToTensorOp`：
   - 若来自函数入参 BlockArgument，归类为 `gmBuffers`；
   - 若来自 `memref::AllocOp`，归类为 `localBuffers`。
-- **关联算子收集 (`collectRelaventOps`)**:
+- **关联算子收集 (`collectRelevantOps`)**:
   - 模式 1 (`buf.hasOneUse()`): `alloc -> to_tensor -> customOp`；
   - 模式 2 (写 buffer): `alloc` 被 `customOp` 写入，随后由单一 `to_tensor` 消费；
-  - 若 `to_tensor` 单一用户为 `hivm.ConvertLayoutOp`，一并纳入待打包集合；
+  - 若 `to_tensor` 单一用户为 `hivm.ConvertLayoutOp`，一并纳入待打包集合（`ConvertLayoutOp` 是 **tensor/memref 双语义**：ODS 为 `TensorOrMemref:$source` / `TensorOrMemref:$result`，故 `to_tensor -> convert_layout` 的 tensor 形态合法；树里其它 UT 只出现 memref 形态，勿据此判定该分支不可达，UT 必须用 tensor 形态）。
+  - 两个放弃打包的前置条件：本地 buffer 有**第二个** `to_tensor` 消费者（打包会撕开活跃值），或 operand 溯源到非 `func` 的 block arg（如 `scf.for` iter_arg，`collectBuffers` 直接 failure -> 该 customOp 整体不打包）。两例均有 UT 固定（`test_pack_memref.mlir` section 6/7）。
 - **核心类型映射 (`determineCoreType`)**:
-  读取 `hivm.tcore_type` 属性，对应映射为 `CUBE_ONLY`、`VECTOR_ONLY` 或 `CUBE_AND_VECTOR`。
+  读取 `hivm.tcore_type` 属性，对应映射为 `CUBE_ONLY`、`VECTOR_ONLY` 或 `CUBE_AND_VECTOR`。注意 `hivm::TCoreType` 实际有 4 个值（`CUBE=1`、`VECTOR=2`、`CUBE_OR_VECTOR=3`、`CUBE_AND_VECTOR=4`），`switch` 的 `default` 会把 **3 和 4 一起**归为 `CUBE_AND_VECTOR` -> 两者都会触发 `OpClassifierPass::handleCubeAndVector` 的双核分裂，`CUBE_OR_VECTOR` 因此被过度分裂（单核即可）。
+- **"打 core_type" == 预分类，不是提示**: `PackMemrefPass::packCustomOpUnit` 只在 `ana.coreType != UNDETERMINED` 时落 `ssbuffer.core_type`（`PackMemref.cpp:122-126`：未识别 tcore_type 必须**不打**属性，才能交给 OpClassifier 按数据流染色），而 `OpClassifierPass::initializePass` 把**任何**带该属性的算子塞进 `preClassifiedOps`（此后不再染色），只有 `OP_CUBE_AND_VECTOR` 会被分裂，`OP_UNDETERMINED` 最终被末尾循环强制成 VECTOR -> "不打属性让 OpClassifier 染色"与"打 UNDETERMINED"并不等价，是两种不同结果。 **对 UT 的后果**：输入 IR 里预置 `ssbuffer.core_type` 的旧用例不再测依赖传播——预置即权威，`memref.copy` 不会再被下游 CUBE 染色（`test_plan_compute_block_subview_memory_deps.mlir` 因此必须去掉预置属性）。
 
 ### Step 2: 封装 Scope (`packScopeOp`)
 - 在待打包算子集合末尾插入 `scope::ScopeOp`；
@@ -69,7 +71,8 @@
 2. **`packScopeOp` 的支配关系与插入点约束**:
    - 打包算子集合必须满足 SSA 拓扑支配关系；
    - 插入点位于集合中最后一个算子（`ops.back()`），外部用户必须位于其后。若 customOp 结果直接作为 `scf.yield` 的操作数，必须确保插入点与块终止符之间的有效放置顺序。
-3. **属性复用保护**:
+3. **`hivm::CustomOp` 没有单返回值 trait**: ODS 只给了 `AttrSizedOperandSegments` / `MemoryEffectsOpInterface` / `ExtraBufferOpInterface` / `HIVMStructuredOpInterface` / `HIVMInferCoreTypeInterface`（`HIVMOps.td:766-776`，`let results = res;`），所以“取 customOp 的结果值”必须手写 `getNumResults() == 1` 守卫，不能假定 `getResult()`。多结果 op 的合法形状受 verifier 约束：`#tensor results == #output tensors`（否则 `expected the number of tensor results (N) to be equal to the number of output tensors (M)`），所以造多结果 UT 必须给足 `outs`。同族但**不同 op**：`hivm.hir.custom_macro`（`CustomMacroOp`）——`TypeSwitch<..., hivm::CustomOp>` 不会命中它。
+4. **属性复用保护**:
    - 解包时不能盲目使用 `op->setAttrs(attrs)` 覆盖所有内部算子，否则会擦除 `hivm.hir.custom` 上的 `symbol`、`bitcode`、`hivm.pipe` 等专用方言属性。仅在算子原有属性为空或仅含旧 `block_id` 时可直接整组复用。
 
 ---
