@@ -369,6 +369,17 @@ std::pair<int, int> UpdateLoopIterTimesPass::calculateFactor(scf::ForOp forOp) {
   return {maxRequiredBuffers, maxX};
 }
 
+// Public wrapper: the stretch factor lives on the pass instance because the
+// per-dependency helpers are pass members. Keeping one implementation avoids
+// the stretch formula drifting apart between this pass and its consumers.
+std::pair<int, int>
+mlir::triton::calculateLoopStretchFactor(scf::ForOp forOp,
+                                         ControlFlowConditionInfo *info) {
+  UpdateLoopIterTimesPass pass;
+  pass.setConditionInfo(info);
+  return pass.calculateFactor(forOp);
+}
+
 static int getConsumerIfOpIndex(Operation *consumerOp,
                                 SmallVector<scf::IfOp> &ifOps,
                                 llvm::DenseMap<Operation *, int> &ifOpIndex) {

@@ -50,6 +50,11 @@ public:
   void runOnOperation() override;
   void setConditionInfo(ControlFlowConditionInfo *info) { this->info = info; }
 
+  // Calculate factor = requiredBuffers / x. Public so that
+  // calculateLoopStretchFactor() can reuse it without a second copy of the
+  // dependency analysis.
+  std::pair<int, int> calculateFactor(scf::ForOp forOp);
+
 private:
   ControlFlowConditionInfo *info = nullptr;
 
@@ -75,9 +80,6 @@ private:
 
   int UpdateWhileLoopCondition(
       DenseMap<int, SmallVector<Operation *>> &mainLoopIdMap);
-
-  // Calculate factor = requiredBuffers / x
-  std::pair<int, int> calculateFactor(scf::ForOp forOp);
 
   // Calculate factor based on intra-core dependencies
   // Iterates all dependencies and computes the maximum required buffer count
@@ -136,6 +138,14 @@ private:
 };
 
 std::unique_ptr<OperationPass<ModuleOp>> createUpdateLoopIterTimesPass();
+
+// Computes {requiredBuffers, x} of the loop-stretch formula
+//   newIterCount = ceil(iterCount * requiredBuffers / x) + ifCount
+// Exposed so that other passes derive the same stretched trip count this pass
+// will emit instead of duplicating the dependency analysis.
+// Returns {-1, -1} when the analysis fails.
+std::pair<int, int> calculateLoopStretchFactor(scf::ForOp forOp,
+                                               ControlFlowConditionInfo *info);
 
 } // namespace triton
 } // namespace mlir

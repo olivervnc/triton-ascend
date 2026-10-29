@@ -39,10 +39,16 @@
 #include "mlir/Pass/Pass.h"
 
 #include "third_party/ascend/include/DynamicCVPipeline/AddControlFlowCondition.h"
+#include "third_party/ascend/include/DynamicCVPipeline/AddControlFlowCondition/StaticSchedule.h"
 
 namespace mlir {
 namespace triton {
 enum class VarUpdateType { INC, DEC };
+
+// Condition mode of the ssbuffer control flow. Legacy keeps the shared ssbuffer
+// counter words; Static replaces the cross-core part with a compile-time
+// schedule expressed as induction-variable predicates.
+enum class CondMode { Legacy, Static };
 
 struct OutputGroupInfo {
   SmallVector<Operation *> outputs;
@@ -58,10 +64,46 @@ public:
 
   void setConditionInfo(ControlFlowConditionInfo *info) { this->info = info; }
 
+  // Compile-time schedule of one main loop: firing steps per ssbuffer.if.
+  struct StaticPlan {
+    StaticCoreSchedule schedule;
+    llvm::DenseMap<scf::IfOp, int> blockIndex;
+    // Induction variable basis: step t runs at iv == lowerBound + step * t.
+    int64_t lowerBound = 0;
+    int64_t step = 1;
+  };
+
 private:
+  // Collects main_loop ops; fails on an unsupported main_loop carrier.
+  int collectMainLoopOps(ModuleOp module,
+                         SmallVector<Operation *> &mainLoopOps);
+
+  // Reads ssbuffer.cond_mode, defaulting to legacy.
+  CondMode readCondMode(ModuleOp module);
+
+  // Plans static schedules for every eligible main loop. Ineligible loops keep
+  // no plan and therefore stay on the legacy counter path.
+  int planStaticSchedules(ModuleOp module, ArrayRef<Operation *> mainLoopOps);
+
+  // Appends one core's block model to `input` and records block indices.
+  int buildStaticCoreModel(
+      scf::ForOp forOp,
+      const DenseMap<int, DenseMap<Operation *, SmallVector<Operation *>>>
+          &crossCoreBuffers,
+      const DenseMap<int, DenseMap<Operation *, SmallVector<Operation *>>>
+          &intraCoreBuffers,
+      StaticScheduleInput &input, StaticPlan &plan);
+
+  // Matches compile-time constant loop bounds; false when any is dynamic.
+  static bool matchConstantBounds(scf::ForOp forOp, int64_t &lowerBound,
+                                  int64_t &upperBound, int64_t &step);
+
+  // Number of ssbuffer.if blocks directly inside the loop body.
+  static int countSSBufferIfOps(scf::ForOp forOp);
+
   SmallVector<SmallVector<Value>> allocSSBuffer(ModuleOp module);
 
-  int updateIfConds(ModuleOp module,
+  int updateIfConds(ModuleOp module, ArrayRef<Operation *> mainLoopOps,
                     SmallVector<SmallVector<Value>> ssbufferPtrs);
 
   // Collect ssbuffer ifOps: for walks body; while-do walks after-region only.
@@ -238,6 +280,11 @@ private:
   DenseMap<Value, Value> controlVarToLatestValue;
   SmallVector<Value> currentUsedVars;
   ControlFlowConditionInfo *info = nullptr;
+  // Static mode state: current loop, its plan, and every planned loop.
+  CondMode condMode = CondMode::Legacy;
+  Operation *currentLoopOp = nullptr;
+  const StaticPlan *currentStaticPlan = nullptr;
+  llvm::DenseMap<Operation *, StaticPlan> staticPlans;
   // Record each ifOp as the variables that need to be controlled when it acts
   // as a consumer or a producer
   llvm::DenseMap<scf::IfOp, TensorIterArgIfOpVars> tensorIterArgIfOpVars;

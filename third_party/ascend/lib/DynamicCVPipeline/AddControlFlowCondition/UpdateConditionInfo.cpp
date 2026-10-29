@@ -20,6 +20,7 @@
  * THE SOFTWARE.
  */
 
+#include <algorithm>
 #include <functional>
 #include <optional>
 #include <string>
@@ -41,9 +42,12 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Location.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/IR/ValueRange.h"
 
 #include "ascend/include/DynamicCVPipeline/AddControlFlowCondition.h"
+#include "ascend/include/DynamicCVPipeline/AddControlFlowCondition/StaticSchedule.h"
+#include "ascend/include/DynamicCVPipeline/AddControlFlowCondition/UpdateLoopIterTimes.h"
 #include "ascend/include/DynamicCVPipeline/Common/SSBufferManager.h"
 #include "ascend/include/DynamicCVPipeline/Common/Utils.h"
 
@@ -324,6 +328,379 @@ void UpdateConditionInfoPass::collectDependencyBuffers(
       intraCoreBuffersMap[loopOp] = intraCoreBuffers;
     }
   }
+}
+
+// Matches a compile-time integer constant; false for anything dynamic.
+static bool constantIntOf(Value value, int64_t &out) {
+  APInt constant;
+  if (!matchPattern(value, m_ConstantInt(&constant)))
+    return false;
+  out = constant.getSExtValue();
+  return true;
+}
+
+// Ceil division for the stretch formula, matching the arith ops emitted by
+// UpdateLoopIterTimes (ceildivsi on signed step types).
+static int64_t ceilDiv(int64_t numerator, int64_t denominator) {
+  return (numerator + denominator - 1) / denominator;
+}
+
+int UpdateConditionInfoPass::collectMainLoopOps(
+    ModuleOp module, SmallVector<Operation *> &mainLoopOps) {
+  WalkResult walkResult = module.walk([&](Operation *op) -> WalkResult {
+    if (CVPipeline::isMainLoopOp(op)) {
+      mainLoopOps.push_back(op);
+      return WalkResult::advance();
+    }
+
+    if (op->hasAttr(kMainLoop)) {
+      LDBG("Found unsupported main loop op: " << *op << "\n");
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  return walkResult.wasInterrupted() ? UPDATE_CONDITION_INFO_FAILED
+                                     : UPDATE_CONDITION_INFO_SUCCESS;
+}
+
+CondMode UpdateConditionInfoPass::readCondMode(ModuleOp module) {
+  auto modeAttr = module->getAttrOfType<StringAttr>(CVPipeline::kCondMode);
+  if (!modeAttr)
+    return CondMode::Legacy;
+  if (modeAttr.getValue() == CVPipeline::kCondModeStatic)
+    return CondMode::Static;
+  if (modeAttr.getValue() == CVPipeline::kCondModeLegacy)
+    return CondMode::Legacy;
+  LDBG("Unknown " << CVPipeline::kCondMode << " value: " << modeAttr.getValue()
+                  << "\n");
+  return CondMode::Legacy;
+}
+
+bool UpdateConditionInfoPass::matchConstantBounds(scf::ForOp forOp,
+                                                  int64_t &lowerBound,
+                                                  int64_t &upperBound,
+                                                  int64_t &step) {
+  return constantIntOf(forOp.getLowerBound(), lowerBound) &&
+         constantIntOf(forOp.getUpperBound(), upperBound) &&
+         constantIntOf(forOp.getStep(), step);
+}
+
+// Blocks carrying ssbuffer.if directly inside the loop body.
+// UpdateLoopIterTimes derives its ifCount the same way (from info->cntArgs), so
+// the trip counts stay identical. Returns -1 when an ssbuffer.if is nested
+// deeper: such a block is not a straight-line pipeline stage, so the loop is
+// not statically schedulable.
+int UpdateConditionInfoPass::countSSBufferIfOps(scf::ForOp forOp) {
+  int count = 0;
+  bool nested = false;
+  forOp.walk([&](Operation *op) -> WalkResult {
+    if (!op->hasAttr(kIf))
+      return WalkResult::advance();
+    if (op->getParentOp() != forOp.getOperation()) {
+      LDBG("ssbuffer.if is not directly nested in the main loop: " << *op
+                                                                   << "\n");
+      nested = true;
+      return WalkResult::interrupt();
+    }
+    ++count;
+    return WalkResult::advance();
+  });
+  return nested ? -1 : count;
+}
+
+int UpdateConditionInfoPass::buildStaticCoreModel(
+    scf::ForOp forOp,
+    const DenseMap<int, DenseMap<Operation *, SmallVector<Operation *>>>
+        &crossCoreBuffers,
+    const DenseMap<int, DenseMap<Operation *, SmallVector<Operation *>>>
+        &intraCoreBuffers,
+    StaticScheduleInput &input, StaticPlan &plan) {
+  SmallVector<scf::IfOp> ifOps;
+  if (collectSSBufferIfOps(forOp.getOperation(), ifOps) ==
+      UPDATE_CONDITION_INFO_FAILED)
+    return UPDATE_CONDITION_INFO_FAILED;
+
+  // Reuse the emitter's own data extraction so the model cannot drift from the
+  // conditions it replaces.
+  DenseMap<int, Value> idxToVar;
+  if (buildIdxToVarMap(forOp.getOperation(), intraCoreBuffers, idxToVar) ==
+      UPDATE_CONDITION_INFO_FAILED)
+    return UPDATE_CONDITION_INFO_FAILED;
+  if (buildTensorIterArgIfOpVarMap(forOp.getOperation()) ==
+      UPDATE_CONDITION_INFO_FAILED)
+    return UPDATE_CONDITION_INFO_FAILED;
+
+  StaticCoreModel model;
+  DenseMap<Value, int> varIds;
+  auto varId = [&](Value value, int64_t init) {
+    auto [it, inserted] = varIds.try_emplace(value, model.varInit.size());
+    if (inserted)
+      model.varInit.push_back(init);
+    return it->second;
+  };
+
+  // Seed the variable table with the initial values UpdateLoopOps uses: inner
+  // dependency conditions start at 0, tensor iter_arg flags at 1.
+  for (auto &entry : idxToVar)
+    varId(entry.second, 0);
+  for (auto &entry : tensorIterArgIfOpVars) {
+    for (Value var : entry.second.consumerVars)
+      varId(var, 1);
+    for (Value var : entry.second.producerVars)
+      varId(var, 1);
+  }
+
+  // flowOpt only kicks in when both buffer counts exceed their thresholds; the
+  // threshold itself is uniform for the module.
+  const bool flowOptEnabled =
+      info->crossCoreBufferCount > CROSS_CORE_BUFFER_COUNT_THRESHOLD &&
+      info->intraCoreBufferCount > INTRA_CORE_BUFFER_COUNT_THRESHOLD;
+  const int64_t flowOptNum =
+      std::min(info->intraCoreBufferCount - 1, info->crossCoreBufferCount);
+
+  auto counterIt = info->blockCounters.find(forOp.getOperation());
+  // Block counters are assigned in walk order, exactly like combineConditions
+  // does with usedCounterNum. Resolve them up front because the flowOpt gate
+  // references the counter of another block.
+  DenseMap<scf::IfOp, int> counterVarOf;
+  if (counterIt != info->blockCounters.end()) {
+    for (auto [blockIdx, ifOp] : llvm::enumerate(ifOps)) {
+      if (blockIdx >= counterIt->second.size())
+        continue;
+      int argIdx = counterIt->second[blockIdx];
+      if (argIdx < 0 ||
+          argIdx >= static_cast<int>(forOp.getNumRegionIterArgs()))
+        return UPDATE_CONDITION_INFO_FAILED;
+      counterVarOf[ifOp] =
+          varId(forOp.getRegionIterArgs()[argIdx], input.lowerBound);
+    }
+  }
+
+  for (auto [blockIdx, ifOp] : llvm::enumerate(ifOps)) {
+    StaticBlockGate gate;
+    SmallVector<int> crossCoreInputValues;
+    SmallVector<int> crossCoreOutputValues;
+    SmallVector<int> intraCoreInputValues;
+    SmallVector<int> intraCoreOutputValues;
+    if (getInputOutputValues(ifOp, crossCoreBuffers, intraCoreBuffers,
+                             crossCoreInputValues, crossCoreOutputValues,
+                             intraCoreInputValues, intraCoreOutputValues) ==
+        UPDATE_CONDITION_INFO_FAILED)
+      return UPDATE_CONDITION_INFO_FAILED;
+
+    gate.crossInGroups.assign(crossCoreInputValues.begin(),
+                              crossCoreInputValues.end());
+    gate.crossOutGroups.assign(crossCoreOutputValues.begin(),
+                               crossCoreOutputValues.end());
+    for (int group : crossCoreOutputValues) {
+      auto bufferIt = crossCoreBuffers.find(group);
+      if (bufferIt == crossCoreBuffers.end())
+        return UPDATE_CONDITION_INFO_FAILED;
+      int buffers = 0;
+      for (auto &entry : bufferIt->second)
+        buffers += static_cast<int>(entry.second.size());
+      input.groupCredit[group] = buffers;
+    }
+
+    // Reduce the variable updates with the emitter's precedence: a variable
+    // updated by several families keeps the last one applied there
+    // (tensorOut > tensorIn > intraOut > intraIn).
+    DenseMap<Value, VarUpdateType> updateTypes;
+    for (int groupIdx : intraCoreInputValues) {
+      auto varIt = idxToVar.find(groupIdx);
+      if (varIt == idxToVar.end())
+        return UPDATE_CONDITION_INFO_FAILED;
+      gate.intraInVars.push_back(varId(varIt->second, 0));
+      updateTypes[varIt->second] = VarUpdateType::DEC;
+    }
+
+    SmallVector<OutputGroupInfo> outputGroups;
+    DenseMap<int, DenseMap<Operation *, SmallVector<Operation *>>>
+        intraBuffersCopy = intraCoreBuffers;
+    if (buildOutputGroups(intraCoreOutputValues, intraBuffersCopy, idxToVar,
+                          outputGroups) == UPDATE_CONDITION_INFO_FAILED)
+      return UPDATE_CONDITION_INFO_FAILED;
+    for (OutputGroupInfo &group : outputGroups) {
+      for (Value var : group.inputVars) {
+        gate.intraOutVars.push_back(
+            {varId(var, 0), static_cast<int>(group.outputs.size())});
+        updateTypes[var] = VarUpdateType::INC;
+      }
+    }
+
+    auto tensorIt = tensorIterArgIfOpVars.find(ifOp);
+    if (tensorIt != tensorIterArgIfOpVars.end()) {
+      for (Value var : tensorIt->second.consumerVars) {
+        gate.tensorInVars.push_back(varId(var, 1));
+        updateTypes[var] = VarUpdateType::DEC;
+      }
+      for (Value var : tensorIt->second.producerVars) {
+        gate.tensorOutVars.push_back(varId(var, 1));
+        updateTypes[var] = VarUpdateType::INC;
+      }
+    }
+
+    for (auto &[var, updateType] : updateTypes)
+      gate.varUpdates.push_back(
+          {varId(var, 0), updateType == VarUpdateType::INC ? 1 : -1});
+
+    // Block counters are assigned in walk order, exactly like
+    // combineConditions does with usedCounterNum.
+    auto counterVarIt = counterVarOf.find(ifOp);
+    if (counterVarIt != counterVarOf.end())
+      gate.counterVar = counterVarIt->second;
+
+    // flowOpt lets the third DAG node run once its source node has progressed
+    // `flowOptNum` steps; it reads the source block's counter.
+    if (flowOptEnabled) {
+      auto pairIt = info->flowOptIfOpPairs.find(ifOp);
+      if (pairIt != info->flowOptIfOpPairs.end()) {
+        auto sourceIt = counterVarOf.find(pairIt->second);
+        if (sourceIt != counterVarOf.end()) {
+          gate.flowOptVar = sourceIt->second;
+          // The emitted condition is (src >= ub) || (src >= lb + step *
+          // optNum); requiring src < ub elsewhere makes that equivalent to src
+          // >= min(...).
+          gate.flowOptMinCounter = std::min(
+              input.lowerBound + input.step * flowOptNum, input.upperBound);
+        }
+      }
+    }
+
+    model.blocks.push_back(std::move(gate));
+    plan.blockIndex[ifOp] = static_cast<int>(blockIdx);
+  }
+
+  plan.lowerBound = input.lowerBound;
+  plan.step = input.step;
+  input.cores.push_back(std::move(model));
+  return UPDATE_CONDITION_INFO_SUCCESS;
+}
+
+int UpdateConditionInfoPass::planStaticSchedules(
+    ModuleOp module, ArrayRef<Operation *> mainLoopOps) {
+  SmallVector<Operation *> loopOps(mainLoopOps.begin(), mainLoopOps.end());
+  DenseMap<int, DenseMap<Operation *, SmallVector<Operation *>>>
+      crossCoreBuffers;
+  DenseMap<Operation *,
+           DenseMap<int, DenseMap<Operation *, SmallVector<Operation *>>>>
+      intraCoreBuffersMap;
+  collectDependencyBuffers(module, loopOps, crossCoreBuffers,
+                           intraCoreBuffersMap);
+
+  // Loops sharing a main_loop id also share one stretched trip count.
+  DenseMap<int, SmallVector<scf::ForOp>> loopsById;
+  for (Operation *loopOp : mainLoopOps) {
+    auto idAttr = loopOp->getAttrOfType<IntegerAttr>(kMainLoop);
+    auto forOp = dyn_cast<scf::ForOp>(loopOp);
+    if (!idAttr || !forOp)
+      continue; // scf.while and malformed carriers stay on the legacy path.
+    loopsById[static_cast<int>(idAttr.getInt())].push_back(forOp);
+  }
+
+  for (auto &entry : loopsById) {
+    // Every loop of the id must be a constant-bound scf.for with identical
+    // bounds; otherwise the firing sets are not compile-time expressible.
+    int64_t lowerBound = 0, upperBound = 0, step = 0;
+    bool eligible = !entry.second.empty();
+    for (auto [idx, forOp] : llvm::enumerate(entry.second)) {
+      int64_t loopLower = 0, loopUpper = 0, loopStep = 0;
+      if (!matchConstantBounds(forOp, loopLower, loopUpper, loopStep)) {
+        LDBG("Static schedule skipped: non-constant bounds on " << forOp
+                                                                << "\n");
+        eligible = false;
+        break;
+      }
+      if (idx == 0) {
+        lowerBound = loopLower;
+        upperBound = loopUpper;
+        step = loopStep;
+      } else if (loopLower != lowerBound || loopUpper != upperBound ||
+                 loopStep != step) {
+        LDBG("Static schedule skipped: peer bounds differ, loop=" << forOp
+                                                                  << "\n");
+        eligible = false;
+        break;
+      }
+    }
+    if (!eligible || step <= 0 || upperBound <= lowerBound)
+      continue;
+
+    // Merge the stretch factor across the id, exactly like
+    // UpdateLoopIterTimes::collectForOpsAndUpdateMax.
+    int maxIfCount = 0;
+    int maxRequiredBuffers = 1;
+    int maxX = 1;
+    for (scf::ForOp forOp : entry.second) {
+      auto [requiredBuffers, x] = calculateLoopStretchFactor(forOp, info);
+      if (requiredBuffers <= 0 || x <= 0) {
+        LDBG("Static schedule skipped: stretch factor failed, loop=" << forOp
+                                                                     << "\n");
+        eligible = false;
+        break;
+      }
+      int ifCount = countSSBufferIfOps(forOp);
+      if (ifCount < 0) {
+        eligible = false;
+        break;
+      }
+      maxIfCount = std::max(maxIfCount, ifCount);
+      if (requiredBuffers * maxX > maxRequiredBuffers * x) {
+        maxRequiredBuffers = requiredBuffers;
+        maxX = x;
+      }
+    }
+    if (!eligible || maxIfCount == 0)
+      continue;
+
+    StaticScheduleInput input;
+    input.lowerBound = lowerBound;
+    input.upperBound = upperBound;
+    input.step = step;
+    input.trip =
+        ceilDiv(ceilDiv(upperBound - lowerBound, step) * maxRequiredBuffers,
+                maxX) +
+        maxIfCount;
+
+    llvm::SmallVector<StaticPlan, 2> plans;
+    bool modelled = true;
+    for (scf::ForOp forOp : entry.second) {
+      StaticPlan plan;
+      if (buildStaticCoreModel(forOp, crossCoreBuffers,
+                               intraCoreBuffersMap.lookup(forOp.getOperation()),
+                               input, plan) == UPDATE_CONDITION_INFO_FAILED) {
+        modelled = false;
+        break;
+      }
+      plans.push_back(std::move(plan));
+    }
+    if (!modelled)
+      continue;
+
+    llvm::SmallVector<StaticCoreSchedule, 2> schedules;
+    if (!buildStaticSchedule(input, schedules)) {
+      LDBG("Static schedule skipped: simulation failed for main_loop id "
+           << entry.first << "\n");
+      continue;
+    }
+
+    for (auto [idx, forOp] : llvm::enumerate(entry.second)) {
+      StaticPlan &plan = plans[idx];
+      if (static_cast<size_t>(idx) >= schedules.size() ||
+          schedules[idx].blocks.size() != plan.blockIndex.size()) {
+        modelled = false;
+        break;
+      }
+      plan.schedule = std::move(schedules[idx]);
+      staticPlans[forOp.getOperation()] = std::move(plan);
+    }
+    if (!modelled)
+      staticPlans.clear();
+  }
+
+  LDBG("Static schedule planned for " << staticPlans.size() << " loop(s)."
+                                      << "\n");
+  return UPDATE_CONDITION_INFO_SUCCESS;
 }
 
 // Helper: Find the tcb group id that contains op
@@ -789,6 +1166,36 @@ int UpdateConditionInfoPass::setCrossCoreCondition(
     Value &crossCoreCond) {
   OpBuilder builder(ifOp);
   Location loc = ifOp.getLoc();
+
+  // ========== Part 0: static schedule shortcut ==========
+  // A planned loop must not touch any ssbuffer counter word: the cross-core
+  // gate is the compile-time firing set of this block, expressed on the loop
+  // induction variable. Intra-core, block-counter and flowOpt conditions are
+  // still emitted below, they only read loop-carried scalars.
+  if (currentStaticPlan) {
+    auto blockIt = currentStaticPlan->blockIndex.find(ifOp);
+    auto forOp = dyn_cast_or_null<scf::ForOp>(currentLoopOp);
+    if (blockIt == currentStaticPlan->blockIndex.end() || !forOp) {
+      // A planned loop must cover every ssbuffer.if it contains; anything else
+      // means the plan and the emitted conditions disagree. Bail out instead of
+      // indexing the ssbuffer pointers, which planning did not allocate.
+      LDBG("Static plan does not cover this if: " << ifOp << "\n");
+      return UPDATE_CONDITION_INFO_FAILED;
+    }
+    // No cross-core dependency: only the loop-carried conditions are needed,
+    // and the ssbuffer pointers were never allocated for this module.
+    if (crossCoreInputValues.empty() && crossCoreOutputValues.empty())
+      return UPDATE_CONDITION_INFO_SUCCESS;
+    OpBuilder staticBuilder(ifOp);
+    crossCoreCond = emitStaticStepPredicate(
+        staticBuilder, loc, forOp.getInductionVar(),
+        currentStaticPlan->lowerBound, currentStaticPlan->step,
+        currentStaticPlan->schedule.blocks[blockIt->second]);
+    LDBG("Static cross-core condition emitted for block " << blockIt->second
+                                                          << ".\n");
+    return crossCoreCond ? UPDATE_CONDITION_INFO_SUCCESS
+                         : UPDATE_CONDITION_INFO_FAILED;
+  }
 
   // ========== Part 1: Preparation ==========
   // Determine whether the current ifblock is on cube or vector core
@@ -1795,36 +2202,24 @@ int UpdateConditionInfoPass::combineConditions(
 
 // Update the conditions of ifOp.
 int UpdateConditionInfoPass::updateIfConds(
-    ModuleOp module, SmallVector<SmallVector<Value>> ssbufferPtrs) {
-  // Walk main_loop for/while ops to update the conditions of ifOp
-  SmallVector<Operation *> mainLoopOps;
-  WalkResult walkResult = module.walk([&](Operation *op) -> WalkResult {
-    if (CVPipeline::isMainLoopOp(op)) {
-      mainLoopOps.push_back(op);
-      return WalkResult::advance();
-    }
-
-    if (op->hasAttr(kMainLoop)) {
-      LDBG("Found unsupported main loop op: " << *op << "\n");
-      return WalkResult::interrupt();
-    }
-    return WalkResult::advance();
-  });
-  if (walkResult.wasInterrupted()) {
-    return UPDATE_CONDITION_INFO_FAILED;
-  }
-
+    ModuleOp module, ArrayRef<Operation *> mainLoopOps,
+    SmallVector<SmallVector<Value>> ssbufferPtrs) {
   // Step0: Collect dependency buffers once outside the loop
+  SmallVector<Operation *> mainLoopOpsCopy(mainLoopOps.begin(),
+                                           mainLoopOps.end());
   DenseMap<int, DenseMap<Operation *, SmallVector<Operation *>>>
       crossCoreBuffers;
   DenseMap<Operation *,
            DenseMap<int, DenseMap<Operation *, SmallVector<Operation *>>>>
       intraCoreBuffersMap;
-  collectDependencyBuffers(module, mainLoopOps, crossCoreBuffers,
+  collectDependencyBuffers(module, mainLoopOpsCopy, crossCoreBuffers,
                            intraCoreBuffersMap);
 
   for (Operation *loopOp : mainLoopOps) {
     controlVarToLatestValue.clear();
+    currentLoopOp = loopOp;
+    auto planIt = staticPlans.find(loopOp);
+    currentStaticPlan = planIt == staticPlans.end() ? nullptr : &planIt->second;
 
     // Step1: Get intraCoreBuffers from pre-collected map
     DenseMap<int, DenseMap<Operation *, SmallVector<Operation *>>>
@@ -1912,6 +2307,8 @@ int UpdateConditionInfoPass::updateIfConds(
     if (updateLoopYield(loopOp) == UPDATE_CONDITION_INFO_FAILED) {
       return UPDATE_CONDITION_INFO_FAILED;
     }
+    currentStaticPlan = nullptr;
+    currentLoopOp = nullptr;
   }
   return UPDATE_CONDITION_INFO_SUCCESS;
 }
@@ -1924,12 +2321,36 @@ void UpdateConditionInfoPass::runOnOperation() {
   }
 
   LDBG("Enter UpdateConditionInfo pass." << "\n");
+
+  SmallVector<Operation *> mainLoopOps;
+  if (collectMainLoopOps(module, mainLoopOps) !=
+      UPDATE_CONDITION_INFO_SUCCESS) {
+    CVPipeline::setFallbackAttr(module, CVPipeline::ERRCODE_FAILED);
+    return;
+  }
+
+  // Step0:Plan the compile-time schedules when requested. Loops without a plan
+  // keep the legacy counter based conditions, so the ssbuffer buffer is only
+  // needed when at least one loop falls back.
+  condMode = readCondMode(module);
+  bool needsSsBuffer = condMode != CondMode::Static;
+  if (condMode == CondMode::Static) {
+    if (planStaticSchedules(module, mainLoopOps) !=
+        UPDATE_CONDITION_INFO_SUCCESS) {
+      CVPipeline::setFallbackAttr(module, CVPipeline::ERRCODE_FAILED);
+      return;
+    }
+    needsSsBuffer = staticPlans.size() != mainLoopOps.size();
+  }
+
   // Step1:Init the ssbufferPtrs
-  SmallVector<SmallVector<Value>> ssbufferPtrs = allocSSBuffer(module);
+  SmallVector<SmallVector<Value>> ssbufferPtrs;
+  if (needsSsBuffer)
+    ssbufferPtrs = allocSSBuffer(module);
 
   // Step2:Update the conditions of ifOp based on the intraCoreDependentMap and
   // crossCoreDependentMap
-  int updateResult = updateIfConds(module, ssbufferPtrs);
+  int updateResult = updateIfConds(module, mainLoopOps, ssbufferPtrs);
 
   if (updateResult != UPDATE_CONDITION_INFO_SUCCESS) {
     LDBG("updateIfConds failed!");

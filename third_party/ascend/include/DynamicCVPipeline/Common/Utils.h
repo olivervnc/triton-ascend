@@ -73,6 +73,12 @@ inline constexpr llvm::StringLiteral kInsertionOptimization =
     "ssbuffer.insertionOptimization";
 inline constexpr llvm::StringLiteral kArg = "ssbuffer.arg";
 inline constexpr llvm::StringLiteral kWhileArg = "ssbuffer.while_arg";
+// Selects how ssbuffer control flow conditions are materialised:
+// "legacy" keeps the shared ssbuffer counter words, "static" replaces the
+// cross-core part with a compile-time schedule on the loop induction variable.
+inline constexpr llvm::StringLiteral kCondMode = "ssbuffer.cond_mode";
+inline constexpr llvm::StringLiteral kCondModeLegacy = "legacy";
+inline constexpr llvm::StringLiteral kCondModeStatic = "static";
 static constexpr llvm::StringLiteral kInlinableQuantScaleAttr =
     "enable_fast_tf32_mul";
 inline constexpr llvm::StringLiteral kGMLoadMultiBufferHintAttr = "gm_load";
