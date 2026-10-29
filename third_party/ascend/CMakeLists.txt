@@ -31,6 +31,12 @@ set_property(DIRECTORY PROPERTY RULE_LAUNCH_LINK ${_saved_launch_link})
 include_directories(${ASCENDNPU_IR_SRC_DIR}/bishengir/include)
 include_directories(${ASCENDNPU_IR_BINARY_DIR}/bishengir/include) # Tablegen'd files
 
+# Plugin sources include the bishengir headers, which depend on the same LLVM 22
+# compatibility switch AscendNPU-IR applies inside its own directory scope.
+if(LLVM_MAJOR_VERSION_22_COMPATIBLE)
+  add_definitions(-D__LLVM_MAJOR_VERSION_22_COMPATIBLE__)
+endif()
+
 add_subdirectory(include)
 add_subdirectory(lib)
 
