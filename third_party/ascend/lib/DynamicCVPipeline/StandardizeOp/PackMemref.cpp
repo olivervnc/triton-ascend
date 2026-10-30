@@ -96,9 +96,8 @@ static void packAllCustomOpUnits(ModuleOp moduleOp) {
   }
 }
 
-/// Packs a custom op together with its buffers into one `scope::ScopeOp`
-/// carrying the analysed core type, so OpClassifierPass can honour it without
-/// re-deriving it.
+/// Pack a custom op together with its buffers into one `scope::ScopeOp`
+/// carrying the analysed core type.
 static void packCustomOpUnit(hivm::CustomOp customOp) {
   auto anaRes = CustomOpAnalysis::get(customOp);
   if (llvm::failed(anaRes)) {
@@ -108,7 +107,7 @@ static void packCustomOpUnit(hivm::CustomOp customOp) {
   auto &ana = anaRes.value();
   LDBG("packing " << ana.customOp);
 
-  auto scopeOp = packScopeOp(ana.relaventOps);
+  auto scopeOp = packScopeOp(ana.relevantOps);
   if (!scopeOp) {
     // Leaving the custom op unpacked is safe: its buffers keep the raw
     // `bufferization.to_tensor` chain that

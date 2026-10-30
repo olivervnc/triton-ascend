@@ -87,7 +87,7 @@ public:
 
   CoreType coreType = UNDETERMINED;
   hivm::PIPE pipe = hivm::PIPE::PIPE_UNASSIGNED;
-  SmallVector<Operation *> relaventOps;
+  SmallVector<Operation *> relevantOps;
 
   /// Analyses `customOp`; fails when its buffers cannot be resolved.
   static llvm::FailureOr<CustomOpAnalysis> get(hivm::CustomOp customOp);
@@ -120,7 +120,7 @@ private:
 
   void determineCoreType();
   llvm::LogicalResult collectBuffers();
-  void collectRelaventOps();
+  void collectRelevantOps();
   void determineLoadOrUnknown();
 
   // For internal usage only - when needed elsewhere, should consider

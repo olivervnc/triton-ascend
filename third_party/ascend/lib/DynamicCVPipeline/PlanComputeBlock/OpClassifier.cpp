@@ -180,7 +180,6 @@ void OpClassifierPass::initializePass(ModuleOp module) {
 
 // Mark an operation as CUBE
 void OpClassifierPass::markCube(Operation *op) {
-  // A pre-stamped op keeps its authoritative core type.
   // `opCoreTypes` is pre-filled for every op in `allOps` (initializePass), so
   // `contains` is always true for them; it only rejects ops outside `allOps`,
   // i.e. ops nested in a skipped `scope.scope` body.
@@ -588,12 +587,7 @@ int OpClassifierPass::patternMatchCUBE() {
         cur = init->get();
         def = cur.getDefiningOp();
       }
-      if (!def) {
-        continue;
-      }
-
-      // Respect a core type decided before this pass.
-      if (preClassifiedOps.contains(def)) {
+      if (!def || preClassifiedOps.contains(def)) {
         continue;
       }
 
@@ -916,8 +910,6 @@ int OpClassifierPass::propagateCubeUpstream() {
 int OpClassifierPass::markRemainingAsVector() {
   LLVM_DEBUG(DBGS() << "--- Step 3: default VECTOR --->\n");
   for (Operation *op : allOps) {
-    // An op stamped by an earlier pass keeps its
-    // authoritative core type.
     if (preClassifiedOps.contains(op)) {
       continue;
     }
@@ -1154,7 +1146,6 @@ int OpClassifierPass::propagateVectorUpstream() {
       }
 
       // Skip operations that should not be marked VECTOR:
-      // - pre-classified ops keep their authoritative type
       // - matmul: never mark matmul as vector (CUBE-only operation)
       if (preClassifiedOps.contains(def) || isa<linalg::MatmulOp>(def) ||
           isa<scf::SCFDialect>(def->getDialect())) {
@@ -1317,8 +1308,6 @@ markLoopBodyAsCube(Operation *loop, Block *body,
     if (op == loop || isa<scf::SCFDialect>(op->getDialect())) {
       return;
     }
-    // An op stamped by an earlier pass keeps its
-    // authoritative core type.
     if (preClassifiedOps.contains(op)) {
       return;
     }
@@ -1376,8 +1365,6 @@ OpCoreType OpClassifierPass::getCoreType(Operation *op) const {
 }
 
 void OpClassifierPass::setCoreType(Operation *op, OpCoreType coreType) {
-  // An op stamped by an earlier pass keeps its
-  // authoritative core type.
   if (preClassifiedOps.contains(op)) {
     return;
   }
@@ -1470,8 +1457,6 @@ void OpClassifierPass::propagateCoreTypeUpwardForYield(
     if (shouldStopPropagationForYield(cur, targetCoreType)) {
       continue;
     }
-    // An op stamped by an earlier pass keeps its authoritative type and is not
-    // traversed further.
     if (preClassifiedOps.contains(cur)) {
       continue;
     }

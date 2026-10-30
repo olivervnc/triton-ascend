@@ -145,4 +145,52 @@ module {
     %3 = bufferization.to_tensor %0 restrict writable : memref<2048xf32> to tensor<2048xf32>
     return %3 : tensor<2048xf32>
   }
+
+  // ============================================================================
+  // 8. pack_read_only_custom_op_with_convert_layout
+  // The custom op only reads the local buffer, so the unit's output is the custom
+  // op result: a layout conversion consuming it joins the unit as well.
+  // ============================================================================
+  // CHECK-LABEL: func.func @pack_read_only_custom_op_with_convert_layout(
+  // CHECK: %[[SCOPE:.*]] = scope.scope : () -> tensor<2048xf32> {
+  // CHECK:   %[[ALLOC:.*]] = memref.alloc() : memref<2048xf32>
+  // CHECK:   %[[T:.*]] = bufferization.to_tensor %[[ALLOC]] restrict writable : memref<2048xf32>
+  // CHECK:   %[[CUSTOM:.*]] = hivm.hir.custom {{.*}} outs(%[[T]] : tensor<2048xf32>) -> tensor<2048xf32>
+  // CHECK:   %[[CL:.*]] = hivm.hir.convert_layout %[[CUSTOM]] output_shape [2048] {{.*}} : (tensor<2048xf32>) -> tensor<2048xf32>
+  // CHECK:   scope.return %[[CL]] : tensor<2048xf32>
+  // CHECK: } {ssbuffer.core_type = "VECTOR"}
+  // CHECK: return %[[SCOPE]]
+  func.func @pack_read_only_custom_op_with_convert_layout(%arg0: tensor<2048xf32>) -> tensor<2048xf32> {
+    %alloc = memref.alloc() : memref<2048xf32>
+    %0 = bufferization.to_tensor %alloc restrict writable : memref<2048xf32> to tensor<2048xf32>
+    %1 = hivm.hir.custom {arg_attrs = [], bitcode = "", hivm.inline_mode = #hivm.inline_mode<always_inline>, hivm.pipe = #hivm.pipe<PIPE_V>, hivm.tcore_type = #hivm.tcore_type<VECTOR>, hivm.vf_mode = #hivm.vf_mode<SIMD>, symbol = "tanh_fp32"} "tanh_fp32" ins(%arg0 : tensor<2048xf32>) outs(%0 : tensor<2048xf32>) -> tensor<2048xf32>
+    %2 = hivm.hir.convert_layout %1 output_shape [2048] {dstLayout = #hivm.data_layout<ND>, srcLayout = #hivm.data_layout<nZ>} : (tensor<2048xf32>) -> tensor<2048xf32>
+    return %2 : tensor<2048xf32>
+  }
+
+  // ============================================================================
+  // 9. no_pack_of_convert_layout_for_multi_result
+  // `hivm.hir.custom` has no single-result trait: with two results there is no
+  // single output value the unit produces, so the layout conversion stays out.
+  // ============================================================================
+  // CHECK-LABEL: func.func @no_pack_of_convert_layout_for_multi_result(
+  // CHECK: %[[SCOPE:.*]] = scope.scope : () -> tensor<2048xf32> {
+  // CHECK:   %[[ALLOC0:.*]] = memref.alloc() : memref<2048xf32>
+  // CHECK:   %[[T0:.*]] = bufferization.to_tensor %[[ALLOC0]] restrict writable : memref<2048xf32>
+  // CHECK:   %[[ALLOC1:.*]] = memref.alloc() : memref<2048xf32>
+  // CHECK:   %[[T1:.*]] = bufferization.to_tensor %[[ALLOC1]] restrict writable : memref<2048xf32>
+  // CHECK:   %[[CUSTOM:.*]]:2 = hivm.hir.custom {{.*}} -> (tensor<2048xf32>, tensor<2048xf32>)
+  // CHECK:   scope.return %[[CUSTOM]]#0 : tensor<2048xf32>
+  // CHECK: } {ssbuffer.core_type = "VECTOR"}
+  // CHECK: %[[CL:.*]] = hivm.hir.convert_layout %[[SCOPE]] output_shape [2048]
+  // CHECK: return %[[CL]]
+  func.func @no_pack_of_convert_layout_for_multi_result(%arg0: tensor<2048xf32>) -> tensor<2048xf32> {
+    %alloc = memref.alloc() : memref<2048xf32>
+    %a0 = bufferization.to_tensor %alloc restrict writable : memref<2048xf32> to tensor<2048xf32>
+    %alloc2 = memref.alloc() : memref<2048xf32>
+    %a1 = bufferization.to_tensor %alloc2 restrict writable : memref<2048xf32> to tensor<2048xf32>
+    %1:2 = hivm.hir.custom {arg_attrs = [], bitcode = "", hivm.inline_mode = #hivm.inline_mode<always_inline>, hivm.pipe = #hivm.pipe<PIPE_V>, hivm.tcore_type = #hivm.tcore_type<VECTOR>, hivm.vf_mode = #hivm.vf_mode<SIMD>, symbol = "tanh_fp32"} "tanh_fp32" ins(%arg0 : tensor<2048xf32>) outs(%a0, %a1 : tensor<2048xf32>, tensor<2048xf32>) -> (tensor<2048xf32>, tensor<2048xf32>)
+    %2 = hivm.hir.convert_layout %1#0 output_shape [2048] {dstLayout = #hivm.data_layout<ND>, srcLayout = #hivm.data_layout<nZ>} : (tensor<2048xf32>) -> tensor<2048xf32>
+    return %2 : tensor<2048xf32>
+  }
 }

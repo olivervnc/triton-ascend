@@ -51,13 +51,13 @@
 #include "mlir/IR/Region.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 
-#include "ascend/include/DynamicCVPipeline/Common/Analysis.h"
 #include "ascend/include/DynamicCVPipeline/Common/MemoryEffectsTracker.h"
 #include "ascend/include/DynamicCVPipeline/Common/SyncWall.h"
 #include "ascend/include/DynamicCVPipeline/Common/Utils.h"
 #include "ascend/include/DynamicCVPipeline/PlanComputeBlock/Common.h"
 
 #include "bishengir/Dialect/Annotation/IR/Annotation.h"
+#include "bishengir/Dialect/Scope/IR/Scope.h"
 
 using namespace mlir;
 static constexpr const char *DEBUG_TYPE = "memory-effects-tracker";
@@ -171,12 +171,29 @@ ArrayRef<Operation *> MemoryDependenceGraph::getExecAfter(Operation *op) const {
 
 using EffectsTy = SmallVector<MemoryEffects::EffectInstance>;
 
-/// Collects the effects of `op` itself, without the per-op-kind special cases
-/// of `collectOuterEffects`. Effects on values defined inside `op` are dropped,
-/// and every remaining effect is remapped to the root memref it aliases, so two
-/// consumers of the same buffer meet on one slot. `unknown` is set when the op
-/// has no effect information at all, which makes the caller treat the op as a
-/// full barrier.
+/// Drop the effects on values defined inside `op`, then remap the rest to the
+/// root memref they alias.
+static EffectsTy filterOuterEffects(EffectsTy effects, Operation *op) {
+  EffectsTy filtered;
+  filtered.reserve(effects.size());
+  for (const auto &e : effects) {
+    Value value = e.getValue();
+    if (!value) {
+      filtered.push_back(e);
+      continue;
+    }
+
+    Value source = traceMemDef(value);
+    if (isDefinedInside(source, op)) {
+      continue;
+    }
+    filtered.push_back(source == value ? e : remapEffectValue(e, source));
+  }
+  return filtered;
+}
+
+/// Collect `op`'s own effects, without the per-op-kind cases of
+/// `collectOuterEffects`; set `unknown` when the op has no effect information.
 static EffectsTy collectOuterEffectsDefault(Operation *op, bool &unknown,
                                             bool recursive) {
   std::optional<SmallVector<MemoryEffects::EffectInstance>> raw;
@@ -193,32 +210,12 @@ static EffectsTy collectOuterEffectsDefault(Operation *op, bool &unknown,
     return {};
   }
 
-  SmallVector<MemoryEffects::EffectInstance> filtered;
-  filtered.reserve(raw->size());
-  for (const auto &e : *raw) {
-    Value value = e.getValue();
-    if (!value) {
-      filtered.push_back(e);
-      continue;
-    }
-
-    Value source = traceMemDef(value);
-    if (isDefinedInside(source, op)) {
-      continue;
-    }
-    filtered.push_back(source == value ? e : remapEffectValue(e, source));
-  }
-  return filtered;
+  return filterOuterEffects(std::move(*raw), op);
 }
 
-/// Returns the memory effects an op exposes to the surrounding block, i.e. the
-/// effects that may create a dependency with another op. Ops whose real
-/// behaviour the generic interface cannot describe get a dedicated case:
-/// `annotation.mark` writes its source, `alloc_tensor` has no effect,
-/// `to_tensor` reads its buffer, and `hivm.hir.custom` reports the buffers
-/// found by `CustomOpAnalysis` (all operands when the analysis fails).
-/// Everything else falls back to `collectOuterEffectsDefault`. Sets `unknown`
-/// when the effects of `op` cannot be determined at all.
+/// Collect the memory effects `op` exposes to the surrounding block, i.e. the
+/// effects that may create a dependency with another op. Set `unknown` when
+/// they cannot be determined.
 static EffectsTy collectOuterEffects(Operation *op, bool &unknown,
                                      bool recursive = true) {
   unknown = false;
@@ -235,34 +232,6 @@ static EffectsTy collectOuterEffects(Operation *op, bool &unknown,
       .Case([](bufferization::ToTensorOp toTensorOp) -> EffectsTy {
         MemoryEffects::EffectInstance scopedRead(MemoryEffects::Read::get());
         return {remapEffectValue(scopedRead, toTensorOp.getBuffer())};
-      })
-      .Case([&](hivm::CustomOp customOp) -> EffectsTy {
-        EffectsTy effects;
-        auto anaRes = CustomOpAnalysis::get(customOp);
-        if (llvm::failed(anaRes)) {
-          LOG_DEBUG("Warning: failed to analyze "
-                    << customOp
-                    << "; conservatively treat all operands as read.\n");
-          for (auto operand : customOp.getOperands()) {
-            if (isa<MemRefType>(operand.getType())) {
-              MemoryEffects::EffectInstance scopedWrite(
-                  MemoryEffects::Write::get());
-              effects.push_back(remapEffectValue(scopedWrite, operand));
-            }
-          }
-          return effects;
-        }
-        auto &ana = anaRes.value();
-        for (auto buf : ana.getReads()) {
-          MemoryEffects::EffectInstance scopedRead(MemoryEffects::Read::get());
-          effects.push_back(remapEffectValue(scopedRead, buf));
-        }
-        for (auto buf : ana.getWrites()) {
-          MemoryEffects::EffectInstance scopedWrite(
-              MemoryEffects::Write::get());
-          effects.push_back(remapEffectValue(scopedWrite, buf));
-        }
-        return effects;
       })
       .Default([&](Operation *op) {
         return collectOuterEffectsDefault(op, unknown, recursive);

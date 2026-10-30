@@ -22,6 +22,7 @@
 
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Support/Debug.h"
 #include "llvm/Support/LogicalResult.h"
 
 #include "mlir/IR/Builders.h"
@@ -31,6 +32,13 @@
 
 using namespace mlir;
 using namespace CVPipeline;
+
+static constexpr const char *DEBUG_TYPE = "scope-op-utils";
+#define LDBG(...)                                                              \
+  LLVM_DEBUG({                                                                 \
+    llvm::dbgs() << '[' << DEBUG_TYPE << "] ";                                 \
+    llvm::dbgs() << __VA_ARGS__ << "\n";                                       \
+  })
 
 namespace mlir::CVPipeline {
 
@@ -90,6 +98,7 @@ unpackScopeOp(scope::ScopeOp scopeOp,
               llvm::SmallVectorImpl<Operation *> *movedOps) {
   auto *block = scopeOp.getBody();
   if (!block) {
+    LDBG("nothing to unpack, scope has no body: " << *scopeOp);
     return llvm::success();
   }
   // Move the body ops out before replacing the scope uses, then the scope
@@ -102,11 +111,16 @@ unpackScopeOp(scope::ScopeOp scopeOp,
   }
   auto *term = block->getTerminator();
   if (!term) {
+    LDBG("cannot unpack, scope body has no terminator: " << *scopeOp);
     return llvm::failure();
   }
   scopeOp.replaceAllUsesWith(term->getOperands());
   // Some uses survived (type mismatch): leave the scope for the caller.
   if (!scopeOp->getUses().empty()) {
+    LDBG("cannot unpack, some of the "
+         << scopeOp->getNumResults()
+         << " scope result(s) are still used after the return rewrite: "
+         << *scopeOp);
     return llvm::failure();
   }
   scopeOp->erase();

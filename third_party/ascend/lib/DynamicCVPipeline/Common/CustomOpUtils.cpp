@@ -34,11 +34,9 @@ static constexpr const char *DEBUG_TYPE = "custom-op-utils";
 using namespace mlir;
 using namespace CVPipeline;
 
-/// Derives `coreType` from the custom op's `hivm.tcore_type`, leaving it
-/// `UNDETERMINED` unless the attribute pins a core: an undetermined value keeps
-/// the op open for OpClassifierPass to colour by its data flow. Only
-/// `CUBE_AND_VECTOR` keeps both cores, which makes OpClassifierPass split the
-/// op into a CUBE and a VECTOR copy.
+/// Derive `coreType` from the custom op's `hivm.tcore_type`; keep it
+/// `UNDETERMINED` unless the attribute pins a core, so OpClassifierPass can
+/// colour the op by its data flow.
 void CustomOpAnalysis::determineCoreType() {
   auto hivmCoreTypeOpt = customOp.getCoreType();
   if (!hivmCoreTypeOpt.has_value()) {
@@ -62,10 +60,10 @@ void CustomOpAnalysis::determineCoreType() {
   }
 }
 
-/// Splits the custom op's tensor / memref operands into GM buffers (a
+/// Split the custom op's tensor / memref operands into GM buffers (a
 /// `func.func` block argument) and local buffers (`memref.alloc`), tracing each
-/// operand back through views. Fails when an operand resolves to a block
-/// argument of some other op, since such a buffer has no defined home.
+/// operand back through views; fail on an operand that resolves to any other
+/// block argument.
 llvm::LogicalResult CustomOpAnalysis::collectBuffers() {
   // Instead of using Dps, the following logic handles more scenarios
   for (auto operand : customOp->getOperands()) {
@@ -96,16 +94,17 @@ llvm::LogicalResult CustomOpAnalysis::collectBuffers() {
   return llvm::success();
 }
 
-/// Collects the ops that build one local buffer: `alloc -> to_tensor -> custom`
-/// for a read-only buffer, or `alloc -> custom -> to_tensor` when the custom op
-/// fills it. A buffer with a second `to_tensor` consumer, or a `to_tensor` with
-/// another consumer, is skipped: packing it would tear a live value apart.
-void CustomOpAnalysis::collectRelaventOps() {
+/// Collect the ops that build one local buffer (`alloc -> to_tensor -> custom`,
+/// or `alloc -> custom -> to_tensor` when the custom op fills the buffer) and
+/// the layout conversion of the unit's output value.
+void CustomOpAnalysis::collectRelevantOps() {
   for (auto buf : localBuffers) {
-    bufferization::ToTensorOp toTensorOp;
+    // Value the unit produces: the custom op's result for a read-only buffer,
+    // the trailing `to_tensor` result when the custom op fills the buffer.
+    Value outValue;
     if (buf.hasOneUse()) {
       // pattern: alloc->to_tensor->customOp
-      toTensorOp =
+      auto toTensorOp =
           llvm::dyn_cast<bufferization::ToTensorOp>(*buf.getUsers().begin());
       if (!toTensorOp) {
         continue;
@@ -114,11 +113,16 @@ void CustomOpAnalysis::collectRelaventOps() {
       if (!tensorRes.hasOneUse() || *tensorRes.getUsers().begin() != customOp) {
         continue;
       }
-      relaventOps.push_back(buf.getDefiningOp());
-      relaventOps.push_back(toTensorOp);
-      relaventOps.push_back(customOp);
+      // No single-result trait: a multi-result op has no single output value.
+      if (customOp->getNumResults() == 1) {
+        outValue = customOp->getResult(0);
+      }
+      relevantOps.push_back(buf.getDefiningOp());
+      relevantOps.push_back(toTensorOp);
+      relevantOps.push_back(customOp);
     } else {
       // pattern: alloc -- filled by customOp -> to_tensor
+      bufferization::ToTensorOp toTensorOp;
       for (auto *user : buf.getUsers()) {
         if (user == customOp) {
           continue;
@@ -136,23 +140,23 @@ void CustomOpAnalysis::collectRelaventOps() {
       if (!toTensorOp) {
         continue;
       }
-      relaventOps.push_back(buf.getDefiningOp());
-      relaventOps.push_back(customOp);
-      relaventOps.push_back(toTensorOp);
+      outValue = toTensorOp.getResult();
+      relevantOps.push_back(buf.getDefiningOp());
+      relevantOps.push_back(customOp);
+      relevantOps.push_back(toTensorOp);
     }
-    if (!toTensorOp->hasOneUse()) {
+    if (!outValue || !outValue.hasOneUse()) {
       continue;
     }
     if (auto convertLayout = llvm::dyn_cast<hivm::ConvertLayoutOp>(
-            *toTensorOp->getUsers().begin())) {
-      relaventOps.push_back(convertLayout);
+            *outValue.getUsers().begin())) {
+      relevantOps.push_back(convertLayout);
     }
   }
 }
 
-/// Decides the data direction from the op's pipe: GM on the source side makes
-/// it a load, GM on the destination side a store. Any other pipe leaves the
-/// direction unknown, and the buffers are then conservatively read and written.
+/// Decide the data direction from the op's pipe: GM on the source side is a
+/// load, GM on the destination side a store, any other pipe unknown.
 void CustomOpAnalysis::determineLoadOrUnknown() {
   PipeAnalysis pipeAna{pipe};
   if (pipeAna.from.contains(hivm::AddressSpace::GM)) {
@@ -173,7 +177,7 @@ FailureOr<CustomOpAnalysis> CustomOpAnalysis::get(hivm::CustomOp customOp) {
     LOG_DEBUG("Failed to analyze: " << customOp << "\n");
     return llvm::failure();
   }
-  result.collectRelaventOps();
+  result.collectRelevantOps();
   result.determineLoadOrUnknown();
   return result;
 }
