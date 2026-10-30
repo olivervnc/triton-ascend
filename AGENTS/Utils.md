@@ -185,6 +185,14 @@ llvm::LogicalResult unpackScopeOp(scope::ScopeOp scopeOp, llvm::SmallVectorImpl<
 - **Location**: `third_party/ascend/include/DynamicCVPipeline/Common/ScopeOpUtils.h:48` / `ScopeOpUtils.cpp:84`
 - **Purpose**: Moves all operations inside `scopeOp` body to the parent block immediately before `scopeOp`, replaces uses of `scopeOp` results with the terminator's operands, and erases `scopeOp`. Optionally populates `movedOps`.
 
+### `isLoadScope`
+```cpp
+inline bool isLoadScope(Operation *op);
+```
+- **Location**: `third_party/ascend/include/DynamicCVPipeline/Common/ScopeOpUtils.h:49`
+- **Purpose**: 判断 `op` 是否为 PackMemref 产出的原子 load 单元（带 `kScopeLoadAttr` 的 `scope::ScopeOp`）。
+- **Consumers**: `ExpLoadPatternPass::matchExpLoadPattern`（load 单元作为 `coreOps` 成员）、`MergeComputeBlockPass::isTensorCarrier` / `cloneOpCrossCubeDep`（跨 CUBE 克隆载体 + 克隆后只给 scope 打 block_id）。
+
 ### `ScalarClosure`
 ```cpp
 class ScalarClosure; // mlir::CVPipeline

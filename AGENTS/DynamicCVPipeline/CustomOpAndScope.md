@@ -117,6 +117,16 @@
 - `PlanCubeBlockPass` / `PlanVectorBlockPass` 遍历 Block 时，若 `block->getParentOp()` 是 `scope::ScopeOp` 则直接 `WalkResult::skip()`，不向 body 内分配 block_id。
 - `getCoreTypeOfSimpleOpOrCf` 对 `scope::ScopeOp` 直接返回其自身 `ssbuffer.core_type`，不再降到 body 推导（body 内算子没有 core_type 标记）。
 
+### 原子性只延伸到 PlanComputeBlock：ComputeBlockOpt 的适配 / 删除结果
+- `ComputeBlockOpt/` 对 `scope::ScopeOp` 的依赖点共三条，均已处理（统一用 `CVPipeline::isLoadScope`，索引见 `AGENTS/Utils.md`）：
+  - `ExpLoadPatternPass`：`coreOps` 的 load 部分改为“载体”概念（`loadOps`）——packed 时为整个 scope，未打包兜底时仍为 `to_tensor/copy/alloc`；搬块时 scope 只走 `bm.updateBlockId`，**不得** `updateBlockIdWithInner`（否则 scope body 被打上 block_id，破坏原子性）。UT：`ComputeBlockOpt/exp_load_pattern.mlir`（packed + raw 两例）。
+  - `MergeComputeBlockPass`：跨 CUBE 克隆的载体从“`to_tensor` 是 CubePre 的 block 成员”改为 `isTensorCarrier`（`to_tensor` 或 load scope），克隆时整 scope 一起克隆，且 `cloneOpCrossCubeDep` 打 id 时跳过 scope body。UT：`ComputeBlockOpt/merge_compute_block_scope.mlir`。
+- **已删除 `UnifyAllocBlockPass`**：`alloc + scf.if{linalg.fill} + subview/copy` 现在整体就是一个 scope，block_id 统一是结构上自明的。删除前它在 packed IR 上是**真实回归**（不只是空转）：`getCommonBlockId` 在 scope body 里拿不到 copy 的 block_id（“There are not CopyOp!”）→ pass 返回 failure → `setFallbackAttr(ERRCODE_FAILED)` → 整个 `--compute-block-opt` fallback；同一 kernel 不打包（raw）则正常。
+- **已删除 `MoveLoadIntoUserPass`**：实测（同一 kernel raw vs packed 的 A/B）raw 下三个 load 载体全部与 consumer 不同块（matmul 3≠2、addf 4≠5），packed 下全部相等 -> planner 已把 scope 与它的 consumer 放进同一 block，该 pass 无工作可做；另 5 个真实 kernel（masked load / 循环累加 / if 分支 / gather / gather+matmul）在 packed 下 carrier-consumer 也全部同块。
+- **残留风险（已知、接受）**：被 PackMemref 跳过、仍留在裸形状的 GM load 单元不再被 unify / 不再被搬进 user block。按现有约定“读到 GM 却未打包”属于 PackMemref 的 bug，所以这里不再保留兼顾两套形状的代码。
+- 探针（判断“某个分支是否仍依赖 op 是 block 成员”而无需改 pass）：把载体 op 的 `ssbuffer.block_id`（或它的 `ssbuffer.load`）去掉再跑单 pass —— `merge_compute_block_scope.mlir` 去掉 scope 的 `ssbuffer.load` 后，block 10 的克隆从 2 处塌成 1 处。
+
+
 ### handleCubeAndVector 的拆分与收敛（已实现）
 - **复制判据**：仅 `opCoreTypes[op] == OP_CUBE_AND_VECTOR`，无其他条件。上游 / packed scope 的单核标识（`CUBE` / `VECTOR`）是权威，**永不复制**；其结果的跨核消费由依赖链承担，不由 OpClassifier 从使用者反向推导。
 - 上游没提供 core type 的算子：Step 1–6 的传播决定类型；若两核都用，传播会把它置为 `CUBE_AND_VECTOR`，随后被复制。
