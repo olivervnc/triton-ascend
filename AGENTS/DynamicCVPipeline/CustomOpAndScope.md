@@ -99,7 +99,9 @@
   - `findToTensorsOver`：从 alloc 的 memref 出发，经 view-like op 反向追踪唯一的 `bufferization.to_tensor`；
   - `collectMemrefUsesBefore`：从该 memref 出发沿 SSA 用户遍历，取所在 block 的顶层祖先，并只保留位于 to_tensor 之前的算子。
 - `<作用于 %a 的算子>` 上溯到所在 block 的顶层算子后，必须满足「是带 `hivm::ExtractLoadStoreAttr` 的 loop」或「其嵌套 user 所在 region 仅含该单个算子」，否则放弃打包。
-- 需随包的 `subview` / `reinterpret_cast` / 标量通过 `ScalarClosure` 收集：调用 `closure.getScalarOps()` 获得按支配序排好的 `ArrayRef`。**有 scope 外消费者时：克隆体插在原算子位置、随包进入 scope，原算子留在 scope 外继续服务外部消费者**（与 `ScalarClosure::capture` 同一约定，见 `PackMemref.cpp:358`）；无外部消费者则直接把原算子并入 scope。
+- 需随包的 `subview` / `reinterpret_cast` / 标量通过 `ScalarClosure` 收集：调用 `closure.getScalarOps()` 获得按支配序排好的 `ArrayRef`。**有 scope 外消费者时：克隆体插在原算子位置、随包进入 scope，原算子留在 scope 外继续服务外部消费者**（与 `ScalarClosure::capture` 同一约定，见 `PackMemref.cpp:365`）；无外部消费者则直接把原算子并入 scope。
+- 克隆规则**沿 def-use 链向后传播**：被克隆算子的原算子留在 scope 外，仍要读自己的操作数，所以喂给它的闭包成员也必须克隆。`buildPackList` 用不动点求这个集合，rewire 只改「随包搬入」的消费者（`inUnit` 与 `inClosure` 减克隆集），被克隆的原算子保持原操作数 —— 否则原算子会读到已搬入 scope 的值，报 `operand #N does not dominate this use`。
+- 闭包成员本身是已打包的 `ssbuffer.load` scope 时留在 scope 外（不嵌套、不克隆）：新的 scope 插在单元末尾，嵌套搬运会让被搬 scope 的结果支配不到它原有的消费者。
 - `ScalarClosure` 若在闭包内触及另一个 `memref.alloc(alloca)`（正常另一个 memref 应为 func arg / GM buffer），**兜底处理：把该标量/视图算子留在 scope 外，其余照常打包，不报异常**（这不是 bug）。保留在 scope 外可保证支配关系（scope body 仍可引用它），并避免把两个 local buffer 强行合入同一单元。
 - 返回值 `PackUnitStatus` 区分三种情况：`Packed`（成功）、`NotALoadUnit`（与 load 无关，静默忽略）、`Failed`（形似 load 单元但模式不一致，例如嵌套 user 所在 region 含多个算子）。`Failed` 会让 `PackMemrefPass` 调用 `signalPassFailure()`，由外层 `AddDynamicCVPipeline` 记录 fallback，而不是让 Unpacked buffer 被后续 Pass 错误调度。
 - 失败不是 core dump：`signalPassFailure()` 是 graceful failure；`NotALoadUnit` 与“闭包含 foreign alloc”的兜底均不触发失败。

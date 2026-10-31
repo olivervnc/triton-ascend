@@ -357,17 +357,32 @@ static bool unitReadsGlobalMemory(ArrayRef<Operation *> unitOps) {
 /// Builds the dominance-ordered op list that moves into the scope: the unit ops
 /// plus the closure scalars. A scalar that still has a consumer outside the
 /// unit is cloned, the internal consumers are rewired to the clone, and the
-/// original keeps dominating the external uses. A scalar reaching a foreign
-/// local allocation stays outside, so two local buffers are never merged into
-/// one unit. Precondition: every op of `unitOps` and `scalars` is a direct
-/// child of the same block (the closure is collected with `includeParent =
-/// false`), which is what makes the in-block sort valid.
+/// original keeps dominating the external uses. A closure op that must stay
+/// where it is (`staysOutside` below) is skipped instead. Precondition: every
+/// op of `unitOps` and `scalars` is a direct child of the same block (the
+/// closure is collected with `includeParent = false`), which is what makes the
+/// in-block sort valid.
 static SmallVector<Operation *> buildPackList(ArrayRef<Operation *> unitOps,
                                               ArrayRef<Operation *> scalars) {
   llvm::DenseSet<Operation *> inUnit(unitOps.begin(), unitOps.end());
 
-  llvm::DenseSet<Operation *> foreignAllocScalars;
+  // A closure op stays outside the new scope in two cases, so the new body
+  // captures its results instead of moving the op in:
+  //   tag            | condition
+  //   ---------------+----------------------------------
+  //   [ForeignAlloc] | reaches a foreign local allocation
+  //   [PackedUnit]   | is itself a `scope.scope` unit
+  // [ForeignAlloc] keeps two local buffers apart; [PackedUnit] keeps every
+  // packed unit atomic, because nesting it would redirect its results to an op
+  // created after the consumers they dominate.
+  llvm::DenseSet<Operation *> staysOutside;
   for (Operation *scalarOp : scalars) {
+    if (isa<scope::ScopeOp>(scalarOp)) {
+      LDBG("load unit closure depends on the packed unit "
+           << scalarOp << "; leaving it outside the new scope");
+      staysOutside.insert(scalarOp);
+      continue;
+    }
     for (Value operand : scalarOp->getOperands()) {
       Value src = traceMemDef(operand);
       if (!src || inUnit.contains(src.getDefiningOp())) {
@@ -377,7 +392,7 @@ static SmallVector<Operation *> buildPackList(ArrayRef<Operation *> unitOps,
               src.getDefiningOp())) {
         LDBG("load unit closure reached a foreign allocation "
              << src << "; leaving " << *scalarOp << " outside the scope");
-        foreignAllocScalars.insert(scalarOp);
+        staysOutside.insert(scalarOp);
         break;
       }
     }
@@ -385,8 +400,34 @@ static SmallVector<Operation *> buildPackList(ArrayRef<Operation *> unitOps,
 
   llvm::DenseSet<Operation *> inClosure;
   for (Operation *scalarOp : scalars) {
-    if (!foreignAllocScalars.contains(scalarOp)) {
+    if (!staysOutside.contains(scalarOp)) {
       inClosure.insert(scalarOp);
+    }
+  }
+
+  // A closure op whose result reaches a consumer that stays outside the scope
+  // is copied: the clone travels in for the internal consumers while the
+  // original keeps serving the outside ones. The rule cascades, because a
+  // copied consumer's own original also stays outside and keeps reading its
+  // operands, so every producer feeding it has to be copied as well.
+  llvm::DenseSet<Operation *> copiedOps;
+  for (bool changed = true; changed;) {
+    changed = false;
+    for (Operation *scalarOp : inClosure) {
+      if (copiedOps.contains(scalarOp)) {
+        continue;
+      }
+      bool escape = llvm::any_of(scalarOp->getResults(), [&](Value result) {
+        return llvm::any_of(result.getUses(), [&](OpOperand &use) {
+          Operation *user = use.getOwner();
+          return !inUnit.contains(user) &&
+                 (!inClosure.contains(user) || copiedOps.contains(user));
+        });
+      });
+      if (escape) {
+        copiedOps.insert(scalarOp);
+        changed = true;
+      }
     }
   }
 
@@ -395,27 +436,12 @@ static SmallVector<Operation *> buildPackList(ArrayRef<Operation *> unitOps,
 
   SmallVector<Operation *> packList(unitOps);
   for (Operation *scalarOp : scalars) {
-    // Fallback: consumers of a foreign allocation stay outside the scope.
-    if (foreignAllocScalars.contains(scalarOp)) {
+    if (staysOutside.contains(scalarOp)) {
       continue;
     }
 
-    bool hasExternalUse = false;
-    for (Value result : scalarOp->getResults()) {
-      for (OpOperand &use : result.getUses()) {
-        Operation *user = use.getOwner();
-        if (!inUnit.contains(user) && !inClosure.contains(user)) {
-          hasExternalUse = true;
-          break;
-        }
-      }
-      if (hasExternalUse) {
-        break;
-      }
-    }
-
-    if (!hasExternalUse) {
-      // No external consumer: move it straight into the scope.
+    // No outside consumer: move it straight into the scope.
+    if (!copiedOps.contains(scalarOp)) {
       packList.push_back(scalarOp);
       continue;
     }
@@ -433,7 +459,11 @@ static SmallVector<Operation *> buildPackList(ArrayRef<Operation *> unitOps,
       Value replacement = cloned->getResult(i);
       for (OpOperand &use : llvm::make_early_inc_range(original.getUses())) {
         Operation *user = use.getOwner();
-        if (inUnit.contains(user) || inClosure.contains(user)) {
+        // Rewire only the consumers that travel into the scope: the original of
+        // a copied op stays outside (see `copiedOps` above) and must keep
+        // reading the original value.
+        if (inUnit.contains(user) ||
+            (inClosure.contains(user) && !copiedOps.contains(user))) {
           use.set(replacement);
         }
       }

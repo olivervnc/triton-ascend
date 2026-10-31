@@ -313,4 +313,46 @@ module {
     %2 = hivm.hir.convert_layout %1#0 output_shape [2048] {dstLayout = #hivm.data_layout<ND>, srcLayout = #hivm.data_layout<nZ>} : (tensor<2048xf32>) -> tensor<2048xf32>
     return %2 : tensor<2048xf32>
   }
+
+  // ============================================================================
+  // 13. pack_load_unit_closure_feeding_outside_consumer
+  // A closure scalar whose only closure consumer is itself copied (it has a
+  // consumer before the unit) must be copied as well: the copy rule cascades,
+  // otherwise the copied op's original would read a value that moved into a
+  // scope created after it.
+  // ============================================================================
+  // CHECK-LABEL: func.func @pack_load_unit_closure_feeding_outside_consumer(
+  // CHECK: %[[A:.*]] = arith.muli
+  // CHECK: %[[B:.*]] = arith.addi %[[A]]
+  // CHECK: memref.store %[[B]], {{.*}} : memref<1xi32>
+  // The whole closure prefix of `%[[B]]` is copied into the scope, so the store
+  // above keeps reading the outer chain.
+  // CHECK: %[[SCOPE:.*]] = scope.scope : () -> tensor<32x64xf16> {
+  // CHECK:   %[[A2:.*]] = arith.muli
+  // CHECK:   %[[B2:.*]] = arith.addi %[[A2]]
+  // CHECK:   %[[IDX:.*]] = arith.index_cast %[[B2]] : i32 to index
+  // CHECK:   %[[ALLOC:.*]] = memref.alloc() : memref<32x64xf16>
+  // CHECK:   %[[SRC:.*]] = memref.reinterpret_cast {{.*}} to offset: [%[[IDX]]], sizes: [32, 64], strides: [64, 1]
+  // CHECK:   %[[DST:.*]] = memref.subview %[[ALLOC]]
+  // CHECK:   memref.copy %[[SRC]], %[[DST]]
+  // CHECK:   %[[T:.*]] = bufferization.to_tensor %[[ALLOC]] restrict writable : memref<32x64xf16>
+  // CHECK:   scope.return %[[T]] : tensor<32x64xf16>
+  // CHECK: } {ssbuffer.load}
+  // CHECK: return %[[SCOPE]]
+  func.func @pack_load_unit_closure_feeding_outside_consumer(
+      %gm: memref<?xf16>, %flag: memref<1xi32>) -> tensor<32x64xf16> {
+    %c0 = arith.constant 0 : index
+    %c32_i32 = arith.constant 32 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %a = arith.muli %c32_i32, %c32_i32 : i32
+    %b = arith.addi %a, %c1_i32 : i32
+    memref.store %b, %flag[%c0] : memref<1xi32>
+    %idx = arith.index_cast %b : i32 to index
+    %alloc = memref.alloc() : memref<32x64xf16>
+    %src = memref.reinterpret_cast %gm to offset: [%idx], sizes: [32, 64], strides: [64, 1] : memref<?xf16> to memref<32x64xf16, strided<[64, 1], offset: ?>>
+    %dst = memref.subview %alloc[0, 0] [32, 64] [1, 1] : memref<32x64xf16> to memref<32x64xf16, strided<[64, 1]>>
+    memref.copy %src, %dst : memref<32x64xf16, strided<[64, 1], offset: ?>> to memref<32x64xf16, strided<[64, 1]>>
+    %t = bufferization.to_tensor %alloc restrict writable : memref<32x64xf16> to tensor<32x64xf16>
+    return %t : tensor<32x64xf16>
+  }
 }
